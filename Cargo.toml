@@ -1,0 +1,24 @@
+[package]
+name = "rustka"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rustka"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustka"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.46", features = ["full"] }
+bytes = "1.10"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2.0"
+kafka-protocol = "0.15.1"
+indexmap = "2.7"
+local-ip-address = "0.6"
+
+[dev-dependencies]
