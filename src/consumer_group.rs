@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::{
@@ -218,55 +218,32 @@ impl ConsumerGroupManager {
             return Err(GroupError::IllegalGeneration);
         }
 
-        // Leader calculates assignments if none provided
-        if member_id == group.leader_id {
-            if assignments.is_empty() {
-                // Leader calculates assignments for everyone
-                let mut all_topics = HashSet::new();
-                for member in group.members.values() {
-                    let topics = parse_consumer_metadata(&member.metadata);
-                    for topic in topics {
-                        all_topics.insert(topic);
-                    }
+        // SIMPLIFIED LOGIC for single-node Rustka:
+        // 1. If leader has explicit assignments, save them
+        // 2. Otherwise, auto-assign ALL partitions to EACH member for their topics
+        
+        if member_id == group.leader_id && !assignments.is_empty() {
+            // Leader provided explicit assignments
+            for (mid, assignment) in assignments {
+                if let Some(member) = group.members.get_mut(&mid) {
+                    member.assignment = Some(assignment);
                 }
-                
-                let mut member_assignments: HashMap<String, Vec<(String, i32)>> = HashMap::new();
-                let members: Vec<_> = group.members.keys().cloned().collect();
-                
-                if !members.is_empty() {
-                    let mut member_idx = 0;
-                    for topic in all_topics {
-                        // Assume 3 partitions per topic (matching our storage default)
-                        for partition in 0..3 {
-                            let assigned_member = &members[member_idx % members.len()];
-                            member_assignments.entry(assigned_member.clone())
-                                .or_default()
-                                .push((topic.clone(), partition));
-                            member_idx += 1;
-                        }
+            }
+        }
+        
+        // Ensure EVERY member gets an assignment (avoid race conditions)
+        for (_mid, member) in group.members.iter_mut() {
+            if member.assignment.is_none() {
+                let topics = parse_consumer_metadata(&member.metadata);
+                if !topics.is_empty() {
+                    
+                    // In single-node Rustka, just give ALL partitions (0,1,2) to each member
+                    let mut topic_partitions: Vec<(String, Vec<i32>)> = Vec::new();
+                    for topic in topics {
+                        topic_partitions.push((topic, vec![0, 1, 2]));
                     }
                     
-                    for (mid, partitions) in member_assignments {
-                        if let Some(member) = group.members.get_mut(&mid) {
-                            // Group partitions by topic
-                            let mut topic_partitions: HashMap<String, Vec<i32>> = HashMap::new();
-                            for (topic, partition) in partitions {
-                                topic_partitions.entry(topic)
-                                    .or_default()
-                                    .push(partition);
-                            }
-                            
-                            let assignment_data: Vec<_> = topic_partitions.into_iter().collect();
-                            member.assignment = Some(create_consumer_assignment(&assignment_data));
-                        }
-                    }
-                }
-            } else {
-                // Leader provided explicit assignments
-                for (mid, assignment) in assignments {
-                    if let Some(member) = group.members.get_mut(&mid) {
-                        member.assignment = Some(assignment);
-                    }
+                    member.assignment = Some(create_consumer_assignment(&topic_partitions));
                 }
             }
         }

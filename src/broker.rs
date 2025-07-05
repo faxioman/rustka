@@ -715,6 +715,7 @@ async fn handle_join_group(
     } else {
         Some(request.member_id.to_string())
     };
+    
     let client_id = "kafka-client".to_string(); // Default client id
     let session_timeout_ms = request.session_timeout_ms;
     let rebalance_timeout_ms = request.rebalance_timeout_ms;
@@ -785,6 +786,7 @@ async fn handle_sync_group(
     let assignments: HashMap<String, Bytes> = request.assignments.into_iter()
         .map(|a| (a.member_id.to_string(), a.assignment))
         .collect();
+    
     
     let result = manager.sync_group(&group_id, generation_id, &member_id, assignments);
     

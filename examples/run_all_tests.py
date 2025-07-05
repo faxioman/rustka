@@ -96,6 +96,7 @@ def main():
     # Check if broker is running
     print("\n⚠️  Make sure the Rustka broker is running on localhost:9092")
     print("   Run 'cargo run --release' in another terminal")
+    print("\n💡 For Sentry testing, run 'python init_sentry_topics.py' first")
     input("\nPress Enter to continue...")
     
     passed = 0
