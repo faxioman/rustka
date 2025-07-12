@@ -1,0 +1,128 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+env:
+  DOCKER_IMAGE: faxioman/rustka
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Compile for amd64
+  compile-amd64:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: x86_64-unknown-linux-musl
+        override: true
+    
+    - name: Install musl-tools
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
+    
+    - name: Build for amd64
+      run: cargo build --release --target x86_64-unknown-linux-musl
+    
+    - name: Upload amd64 artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rustka-amd64
+        path: target/x86_64-unknown-linux-musl/release/rustka
+        retention-days: 1
+
+  # Compile for arm64
+  compile-arm64:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Install cross
+      run: cargo install cross --git https://github.com/cross-rs/cross
+    
+    - name: Build for arm64
+      run: cross build --release --target aarch64-unknown-linux-musl
+    
+    - name: Upload arm64 artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rustka-arm64
+        path: target/aarch64-unknown-linux-musl/release/rustka
+        retention-days: 1
+
+  # Build and push Docker images
+  docker-build-and-push:
+    needs: [compile-amd64, compile-arm64]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download amd64 artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: rustka-amd64
+        path: ./artifacts/amd64/
+    
+    - name: Download arm64 artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: rustka-arm64
+        path: ./artifacts/arm64/
+    
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Create Dockerfile
+      run: |
+        cat > Dockerfile <<EOF
+        FROM debian:bookworm-slim
+        
+        RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+        
+        # Argument to specify the architecture
+        ARG TARGETARCH
+        
+        # Copy the compiled binary based on architecture
+        COPY artifacts/\${TARGETARCH}/rustka /usr/local/bin/rustka
+        
+        # Make the binary executable
+        RUN chmod +x /usr/local/bin/rustka
+        
+        # Expose Kafka port
+        EXPOSE 9092
+        
+        ENTRYPOINT ["/usr/local/bin/rustka"]
+        EOF
+    
+    - name: Build and push multi-platform image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:latest
+          ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
