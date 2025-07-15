@@ -39,6 +39,9 @@ TEST_ORDER = [
     # Commit log tests
     ("test_commit_log_fix.py", "Commit log key fix verification"),
     ("test_snuba_compatibility.py", "Snuba commit log compatibility"),
+    
+    # Authentication tests
+    ("test_authentication.py", "SASL PLAIN authentication test"),
 ]
 
 def run_test(test_file, description):

@@ -26,6 +26,10 @@ use kafka_protocol::messages::{
     leave_group_response::{LeaveGroupResponse, MemberResponse},
     list_offsets_request::ListOffsetsRequest,
     list_offsets_response::{ListOffsetsResponse, ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
+    sasl_handshake_request::SaslHandshakeRequest,
+    sasl_handshake_response::SaslHandshakeResponse,
+    sasl_authenticate_request::SaslAuthenticateRequest,
+    sasl_authenticate_response::SaslAuthenticateResponse,
     request_header::RequestHeader,
     response_header::ResponseHeader,
 };
@@ -38,6 +42,12 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 use std::env;
 use local_ip_address::local_ip;
+
+#[derive(Debug, Clone)]
+struct ConnectionState {
+    authenticated: bool,
+    username: Option<String>,
+}
 
 fn get_advertised_host() -> String {
     // First check environment variable
@@ -117,6 +127,11 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let peer_addr = socket.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
     let mut size_buf = [0u8; 4];
+    let mut conn_state = ConnectionState {
+        authenticated: false,
+        username: None,
+    };
+    let mut expecting_raw_sasl_auth = false;
 
     loop {
         if socket.read_exact(&mut size_buf).await.is_err() {
@@ -126,6 +141,32 @@ async fn handle_connection(
 
         let size = i32::from_be_bytes(size_buf) as usize;
         debug!("Incoming message size: {}", size);
+
+        // Handle raw SASL auth bytes (legacy format)
+        if expecting_raw_sasl_auth {
+            debug!("Expecting raw SASL auth bytes of size {}", size);
+            let mut auth_buf = vec![0u8; size];
+            socket.read_exact(&mut auth_buf).await?;
+            
+            // Parse PLAIN auth format: \0username\0password
+            let auth_str = String::from_utf8_lossy(&auth_buf);
+            let parts: Vec<&str> = auth_str.split('\0').collect();
+            if parts.len() >= 3 {
+                let username = parts[1];
+                debug!("Raw SASL authentication for user: {}", username);
+                conn_state.authenticated = true;
+                conn_state.username = Some(username.to_string());
+                info!("Authentication successful for user: {}", username);
+            }
+            
+            // Send raw response: 4 bytes size + empty payload
+            let response_size = 0i32;
+            socket.write_all(&response_size.to_be_bytes()).await?;
+            socket.flush().await?;
+            
+            expecting_raw_sasl_auth = false;
+            continue;
+        }
 
         let mut message_buf = vec![0u8; size];
         socket.read_exact(&mut message_buf).await?;
@@ -152,24 +193,38 @@ async fn handle_connection(
                header.client_id, buf.remaining());
 
         // Handle request based on API key
-        let response_bytes = match header.request_api_key {
-            18 => handle_api_versions(&header).await?, // ApiVersions
-            3 => handle_metadata(&header, &mut buf, storage.clone()).await?, // Metadata
-            0 => handle_produce(&header, &mut buf, storage.clone()).await?, // Produce
-            1 => handle_fetch(&header, &mut buf, storage.clone()).await?, // Fetch
-            2 => handle_list_offsets(&header, &mut buf, storage.clone()).await?, // ListOffsets
-            10 => handle_find_coordinator(&header, &mut buf, group_manager.clone()).await?, // FindCoordinator
-            11 => handle_join_group(&header, &mut buf, group_manager.clone(), &peer_addr).await?, // JoinGroup
-            14 => handle_sync_group(&header, &mut buf, group_manager.clone()).await?, // SyncGroup
-            12 => handle_heartbeat(&header, &mut buf, group_manager.clone()).await?, // Heartbeat
-            8 => handle_offset_commit(&header, &mut buf, group_manager.clone()).await?, // OffsetCommit
-            9 => handle_offset_fetch(&header, &mut buf, group_manager.clone()).await?, // OffsetFetch
-            13 => handle_leave_group(&header, &mut buf, group_manager.clone()).await?, // LeaveGroup
+        let response_result = match header.request_api_key {
+            18 => Ok((handle_api_versions(&header).await?, false)), // ApiVersions
+            3 => Ok((handle_metadata(&header, &mut buf, storage.clone()).await?, false)), // Metadata
+            0 => Ok((handle_produce(&header, &mut buf, storage.clone()).await?, false)), // Produce
+            1 => Ok((handle_fetch(&header, &mut buf, storage.clone()).await?, false)), // Fetch
+            2 => Ok((handle_list_offsets(&header, &mut buf, storage.clone()).await?, false)), // ListOffsets
+            10 => Ok((handle_find_coordinator(&header, &mut buf, group_manager.clone()).await?, false)), // FindCoordinator
+            11 => Ok((handle_join_group(&header, &mut buf, group_manager.clone(), &peer_addr).await?, false)), // JoinGroup
+            14 => Ok((handle_sync_group(&header, &mut buf, group_manager.clone()).await?, false)), // SyncGroup
+            12 => Ok((handle_heartbeat(&header, &mut buf, group_manager.clone()).await?, false)), // Heartbeat
+            8 => Ok((handle_offset_commit(&header, &mut buf, group_manager.clone()).await?, false)), // OffsetCommit
+            9 => Ok((handle_offset_fetch(&header, &mut buf, group_manager.clone()).await?, false)), // OffsetFetch
+            13 => Ok((handle_leave_group(&header, &mut buf, group_manager.clone()).await?, false)), // LeaveGroup
+            17 => handle_sasl_handshake(&header, &mut buf).await, // SaslHandshake - returns (response, expecting_raw_auth)
+            36 => {
+                let response = handle_sasl_authenticate(&header, &mut buf, &mut conn_state).await?;
+                Ok((response, false))
+            }, // SaslAuthenticate
             _ => {
                 error!("Unsupported API key: {}", header.request_api_key);
                 continue;
             }
         };
+
+        let (response_bytes, expect_raw_auth) = match response_result {
+            Ok((bytes, flag)) => (bytes, flag),
+            Err(e) => return Err(e),
+        };
+
+        if expect_raw_auth {
+            expecting_raw_sasl_auth = true;
+        }
 
         // Send response
         let response_size = (response_bytes.len() as i32).to_be_bytes();
@@ -320,6 +375,8 @@ async fn handle_api_versions(
         (8, 0, 2),   // OffsetCommit
         (9, 0, 2),   // OffsetFetch
         (13, 0, 1),  // LeaveGroup
+        (17, 0, 1),  // SaslHandshake
+        (36, 0, 2),  // SaslAuthenticate
     ];
     
     for (api_key, min_version, max_version) in supported_apis {
@@ -1141,4 +1198,74 @@ fn error_code_from_group_error(error: &GroupError) -> i16 {
         GroupError::IllegalGeneration => 22,      // ILLEGAL_GENERATION
         GroupError::InconsistentGroupProtocol => 23, // INCONSISTENT_GROUP_PROTOCOL
     }
+}
+
+async fn handle_sasl_handshake(
+    header: &RequestHeader,
+    buf: &mut BytesMut,
+) -> Result<(Vec<u8>, bool), Box<dyn std::error::Error + Send + Sync>> {
+    debug!("Handling SaslHandshake request version {}", header.request_api_version);
+    
+    let request = SaslHandshakeRequest::decode(buf, header.request_api_version)?;
+    debug!("Client requested SASL mechanism: {}", request.mechanism);
+    
+    let mut response = SaslHandshakeResponse::default();
+    response.error_code = 0; // Success
+    response.mechanisms = vec!["PLAIN".into()]; // We only support PLAIN
+
+    let mut response_header = ResponseHeader::default();
+    response_header.correlation_id = header.correlation_id;
+
+    let mut response_buf = BytesMut::new();
+    response_header.encode(&mut response_buf, 0)?;
+    response.encode(&mut response_buf, header.request_api_version)?;
+    
+    // For legacy clients (pre-0.10.2), expect raw SASL auth bytes instead of SaslAuthenticateRequest
+    // This is determined by the absence of SaslAuthenticate API in the version negotiation
+    let expect_raw_auth = header.request_api_version == 0;
+    
+    Ok((response_buf.to_vec(), expect_raw_auth))
+}
+
+async fn handle_sasl_authenticate(
+    header: &RequestHeader,
+    buf: &mut BytesMut,
+    conn_state: &mut ConnectionState,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    debug!("Handling SaslAuthenticate request");
+    
+    let request = SaslAuthenticateRequest::decode(buf, header.request_api_version)?;
+    
+    // For PLAIN mechanism, the auth bytes format is: \0username\0password
+    let auth_bytes = &request.auth_bytes;
+    let auth_str = String::from_utf8_lossy(auth_bytes);
+    debug!("Auth bytes received (length: {})", auth_bytes.len());
+    
+    // Simple parsing of PLAIN auth: \0username\0password
+    let parts: Vec<&str> = auth_str.split('\0').collect();
+    if parts.len() >= 3 {
+        let username = parts[1];
+        let _password = parts[2];
+        debug!("Authentication attempt - username: {}", username);
+        
+        // Always accept any username/password combination
+        conn_state.authenticated = true;
+        conn_state.username = Some(username.to_string());
+        info!("Authentication successful for user: {}", username);
+    }
+    
+    let mut response = SaslAuthenticateResponse::default();
+    response.error_code = 0; // Always succeed
+    response.error_message = None;
+    response.auth_bytes = Bytes::new(); // Empty response for PLAIN
+    response.session_lifetime_ms = 0; // No session expiry
+
+    let mut response_header = ResponseHeader::default();
+    response_header.correlation_id = header.correlation_id;
+
+    let mut response_buf = BytesMut::new();
+    response_header.encode(&mut response_buf, 0)?;
+    response.encode(&mut response_buf, header.request_api_version)?;
+    
+    Ok(response_buf.to_vec())
 }
