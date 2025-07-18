@@ -96,11 +96,12 @@ def test_consumer_group():
         messages = consumer.poll(timeout_ms=5000)
         if messages:
             print(f"✓ Consumed {sum(len(msgs) for msgs in messages.values())} messages in group")
+            consumer.close()
+            return True
         else:
-            print("✗ No messages consumed (might be normal if offset already committed)")
-        
-        consumer.close()
-        return True
+            print("✗ No messages consumed")
+            consumer.close()
+            return False
         
     except Exception as e:
         print(f"✗ Consumer group failed: {e}")
