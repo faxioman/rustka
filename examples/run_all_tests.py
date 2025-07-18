@@ -26,6 +26,7 @@ TEST_ORDER = [
     
     # Record batch and advanced features
     ("test_recordbatch.py", "Record batch format test"),
+    ("test_headers.py", "Kafka message headers support"),
     
     # Consumer group tests
     ("test_consumer_group.py", "Consumer group test"),

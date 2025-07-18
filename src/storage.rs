@@ -5,6 +5,7 @@ use kafka_protocol::records::{
     Record as KafkaRecord, RecordBatchEncoder, RecordEncodeOptions, Compression, TimestampType
 };
 use indexmap::IndexMap;
+use kafka_protocol::protocol::StrBytes;
 
 // Simple CRC32 implementation for Kafka message format
 fn crc32(data: &[u8]) -> u32 {
@@ -44,6 +45,7 @@ struct Topic {
 struct Record {
     key: Option<Bytes>,
     value: Bytes,
+    headers: IndexMap<StrBytes, Option<Bytes>>,
 }
 
 struct Partition {
@@ -68,6 +70,10 @@ impl InMemoryStorage {
     }
     
     pub fn append_records(&mut self, topic: &str, partition: i32, key: Option<Bytes>, value: Bytes) -> i64 {
+        self.append_records_with_headers(topic, partition, key, value, IndexMap::new())
+    }
+    
+    pub fn append_records_with_headers(&mut self, topic: &str, partition: i32, key: Option<Bytes>, value: Bytes, headers: IndexMap<StrBytes, Option<Bytes>>) -> i64 {
         let topic_entry = self.topics.entry(topic.to_string()).or_insert_with(|| {
             let mut partitions = HashMap::new();
             // Auto-create 3 partitions by default
@@ -89,7 +95,7 @@ impl InMemoryStorage {
         
         let offset = partition_entry.next_offset;
         
-        partition_entry.records.push(Record { key, value });
+        partition_entry.records.push(Record { key, value, headers });
         partition_entry.next_offset += 1;
         
         offset
@@ -254,7 +260,7 @@ impl InMemoryStorage {
                 timestamp: current_offset * 1000, // Simple timestamp based on offset
                 key: stored_record.key.clone(),
                 value: Some(stored_record.value.clone()),
-                headers: IndexMap::new(),
+                headers: stored_record.headers.clone(),
             };
             
             // Estimate size (rough approximation)
@@ -295,6 +301,16 @@ impl InMemoryStorage {
     
     // Methods fetch_records, fetch_single_record, and fetch_records_multi were removed
     // as they were not used in production code
+    
+    pub fn topic_has_headers(&self, topic: &str, partition: i32) -> bool {
+        if let Some(topic_data) = self.topics.get(topic) {
+            if let Some(partition_data) = topic_data.partitions.get(&partition) {
+                // Check if any record has headers
+                return partition_data.records.iter().any(|r| !r.headers.is_empty());
+            }
+        }
+        false
+    }
     
     pub fn get_high_watermark(&self, topic: &str, partition: i32) -> Result<i64, StorageError> {
         let topic_data = self.topics

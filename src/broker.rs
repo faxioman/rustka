@@ -34,6 +34,8 @@ use kafka_protocol::messages::{
     response_header::ResponseHeader,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use kafka_protocol::records::{RecordBatchDecoder};
+use indexmap::IndexMap;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -234,6 +236,28 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+// Parse RecordBatch (magic byte 2) and extract messages with key, value and headers
+fn parse_record_batch(data: &Bytes) -> Vec<(Option<Bytes>, Bytes, IndexMap<StrBytes, Option<Bytes>>)> {
+    let mut messages = Vec::new();
+    let mut buf = data.clone();
+    
+    // Try to decode as RecordBatch
+    match RecordBatchDecoder::decode(&mut buf) {
+        Ok(record_set) => {
+            debug!("Decoded RecordBatch with {} records", record_set.records.len());
+            
+            for record in record_set.records {
+                messages.push((record.key, record.value.unwrap_or(Bytes::new()), record.headers));
+            }
+        }
+        Err(e) => {
+            debug!("Failed to decode RecordBatch: {:?}", e);
+        }
+    }
+    
+    messages
 }
 
 // Parse a MessageSet and extract individual messages with key and value
@@ -565,7 +589,37 @@ async fn handle_produce(
                 // For API version >= 2, records are in RecordBatch format
                 let mut base_offset = 0i64;
                 
-                if header.request_api_version <= 2 {
+                // Try to parse as RecordBatch first (for API v3+)
+                if header.request_api_version >= 3 {
+                    let batch_messages = parse_record_batch(&records);
+                    if !batch_messages.is_empty() {
+                        debug!("Extracted {} messages from RecordBatch", batch_messages.len());
+                        for (i, (key, value, headers)) in batch_messages.iter().enumerate() {
+                            let offset = storage.append_records_with_headers(&topic_name, partition, key.clone(), value.clone(), headers.clone());
+                            if i == 0 {
+                                base_offset = offset;
+                            }
+                            debug!("Stored message {} at offset {} with {} headers", i, offset, headers.len());
+                        }
+                    } else {
+                        // Fall back to MessageSet format if RecordBatch parsing fails
+                        let messages = parse_message_set(&records);
+                        debug!("Extracted {} messages from MessageSet (fallback)", messages.len());
+                        
+                        if !messages.is_empty() {
+                            for (i, (key, value)) in messages.iter().enumerate() {
+                                let offset = storage.append_records(&topic_name, partition, key.clone(), value.clone());
+                                if i == 0 {
+                                    base_offset = offset;
+                                }
+                                debug!("Stored message {} at offset {}", i, offset);
+                            }
+                        } else {
+                            // If no messages were parsed, store the raw data as fallback
+                            base_offset = storage.append_records(&topic_name, partition, None, records);
+                        }
+                    }
+                } else {
                     // Parse MessageSet format (used in API v0, v1, v2)
                     let messages = parse_message_set(&records);
                     debug!("Extracted {} messages from MessageSet", messages.len());
@@ -583,9 +637,6 @@ async fn handle_produce(
                         // If no messages were parsed, store the raw data as fallback
                         base_offset = storage.append_records(&topic_name, partition, None, records);
                     }
-                } else {
-                    // For newer versions, store as-is (would need RecordBatch parsing)
-                    base_offset = storage.append_records(&topic_name, partition, None, records);
                 }
                 
                 debug!("Produced to topic={}, partition={}, base_offset={}", topic_name, partition, base_offset);
@@ -643,12 +694,12 @@ async fn handle_fetch(
                    topic_name, partition.partition, partition.fetch_offset, 
                    partition.partition_max_bytes);
             
-            // For API v4+, use RecordBatch format (not implemented yet)
-            // For API v3 and below, we can only return one record at a time
-            // This is a limitation of kafka-protocol-rs library
-            let use_record_batch = header.request_api_version >= 4;
+            // Check if we need to use RecordBatch format
+            // Use RecordBatch for API v4+ OR when messages have headers
+            let needs_record_batch = header.request_api_version >= 4 || 
+                storage.topic_has_headers(&topic_name, partition.partition);
             
-            let (error_code, high_watermark, records_bytes) = if use_record_batch {
+            let (error_code, high_watermark, records_bytes) = if needs_record_batch {
                 // Use RecordBatch format for API v4+
                 let batch_result = storage.fetch_batch_recordbatch(
                     &topic_name,
