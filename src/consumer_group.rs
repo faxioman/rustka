@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
-    pub group_id: String,
+    pub _group_id: String,
     pub protocol_type: String,
     pub generation_id: i32,
     pub leader_id: String,
@@ -27,11 +27,11 @@ pub enum GroupState {
 
 #[derive(Debug, Clone)]
 pub struct GroupMember {
-    pub member_id: String,
-    pub client_id: String,
-    pub client_host: String,
+    pub _member_id: String,
+    pub _client_id: String,
+    pub _client_host: String,
     pub session_timeout_ms: i32,
-    pub rebalance_timeout_ms: i32,
+    pub _rebalance_timeout_ms: i32,
     pub last_heartbeat: Instant,
     pub metadata: Bytes,
     pub assignment: Option<Bytes>,
@@ -80,12 +80,12 @@ impl ConsumerGroupManager {
         protocol_type: String,
         protocols: Vec<(String, Bytes)>,
     ) -> Result<JoinGroupResult, GroupError> {
-        let is_new_member = member_id.is_none();
+        let _is_new_member = member_id.is_none();
         let member_id = member_id.unwrap_or_else(|| self.generate_member_id(&client_id));
         
         let group = self.groups.entry(group_id.clone()).or_insert_with(|| {
             ConsumerGroup {
-                group_id: group_id.clone(),
+                _group_id: group_id.clone(),
                 protocol_type: protocol_type.clone(),
                 generation_id: 0,
                 leader_id: String::new(),
@@ -104,11 +104,11 @@ impl ConsumerGroupManager {
                 // First member joining - becomes leader immediately
                 
                 let member = GroupMember {
-                    member_id: member_id.clone(),
-                    client_id,
-                    client_host,
+                    _member_id: member_id.clone(),
+                    _client_id: client_id,
+                    _client_host: client_host,
                     session_timeout_ms,
-                    rebalance_timeout_ms,
+                    _rebalance_timeout_ms: rebalance_timeout_ms,
                     last_heartbeat: Instant::now(),
                     metadata: protocols.first().map(|(_, m)| m.clone()).unwrap_or_default(),
                     assignment: None,
@@ -143,11 +143,11 @@ impl ConsumerGroupManager {
                 
                 // Add this new member
                 let member = GroupMember {
-                    member_id: member_id.clone(),
-                    client_id,
-                    client_host,
+                    _member_id: member_id.clone(),
+                    _client_id: client_id,
+                    _client_host: client_host,
                     session_timeout_ms,
-                    rebalance_timeout_ms,
+                    _rebalance_timeout_ms: rebalance_timeout_ms,
                     last_heartbeat: Instant::now(),
                     metadata: protocols.first().map(|(_, m)| m.clone()).unwrap_or_default(),
                     assignment: None,
@@ -168,11 +168,11 @@ impl ConsumerGroupManager {
                 
                 // Add or update member
                 let member = GroupMember {
-                    member_id: member_id.clone(),
-                    client_id,
-                    client_host,
+                    _member_id: member_id.clone(),
+                    _client_id: client_id,
+                    _client_host: client_host,
                     session_timeout_ms,
-                    rebalance_timeout_ms,
+                    _rebalance_timeout_ms: rebalance_timeout_ms,
                     last_heartbeat: Instant::now(),
                     metadata: protocols.first().map(|(_, m)| m.clone()).unwrap_or_default(),
                     assignment: None,
@@ -250,11 +250,11 @@ impl ConsumerGroupManager {
                     
                     // Add this new member
                     let member = GroupMember {
-                        member_id: member_id.clone(),
-                        client_id,
-                        client_host,
+                        _member_id: member_id.clone(),
+                        _client_id: client_id,
+                        _client_host: client_host,
                         session_timeout_ms,
-                        rebalance_timeout_ms,
+                        _rebalance_timeout_ms: rebalance_timeout_ms,
                         last_heartbeat: Instant::now(),
                         metadata: protocols.first().map(|(_, m)| m.clone()).unwrap_or_default(),
                         assignment: None,

@@ -289,7 +289,7 @@ impl InMemoryStorage {
         
         match RecordBatchEncoder::encode(&mut buf, &records, &options) {
             Ok(_) => Ok((high_watermark, Some(buf.freeze()))),
-            Err(e) => {
+            Err(_) => {
                 Ok((high_watermark, None))
             }
         }
