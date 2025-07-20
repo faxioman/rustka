@@ -228,7 +228,6 @@ async fn handle_connection(
             expecting_raw_sasl_auth = true;
         }
 
-        // Send response
         let response_size = (response_bytes.len() as i32).to_be_bytes();
         socket.write_all(&response_size).await?;
         socket.write_all(&response_bytes).await?;
@@ -824,7 +823,11 @@ async fn handle_join_group(
         Some(request.member_id.to_string())
     };
     
-    let client_id = "kafka-client".to_string(); // Default client id
+    let client_id = if let Some(client_id_str) = header.client_id.as_ref() {
+        client_id_str.to_string()
+    } else {
+        "kafka-client".to_string()
+    };
     let session_timeout_ms = request.session_timeout_ms;
     let rebalance_timeout_ms = request.rebalance_timeout_ms;
     
@@ -1248,6 +1251,7 @@ fn error_code_from_group_error(error: &GroupError) -> i16 {
         GroupError::UnknownMember => 25,          // UNKNOWN_MEMBER_ID
         GroupError::IllegalGeneration => 22,      // ILLEGAL_GENERATION
         GroupError::InconsistentGroupProtocol => 23, // INCONSISTENT_GROUP_PROTOCOL
+        GroupError::RebalanceInProgress => 27,    // REBALANCE_IN_PROGRESS
     }
 }
 

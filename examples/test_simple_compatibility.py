@@ -69,28 +69,32 @@ def test_consumer_group():
     print("\n3. Testing consumer groups...")
     
     try:
-        # Consumer con gruppo
-        consumer = KafkaConsumer(
-            'test-topic',
-            bootstrap_servers=['localhost:9092'],
-            group_id='test-group',
-            auto_offset_reset='latest',
-            enable_auto_commit=True,
-            api_version=(0, 10, 0)
-        )
+        # Use unique topic for this test
+        topic_name = f'test-cg-topic-{int(time.time())}'
+        group_id = f'test-group-{int(time.time())}'
         
-        print("✓ Joined consumer group 'test-group'")
-        
-        # Produce a message
+        # Produce a message first
         producer = KafkaProducer(
             bootstrap_servers=['localhost:9092'],
             api_version=(0, 10, 0)
         )
         
         test_msg = f'Group test at {time.time()}'
-        producer.send('test-topic', test_msg.encode())
+        producer.send(topic_name, test_msg.encode())
         producer.flush()
         producer.close()
+        
+        # Consumer with group
+        consumer = KafkaConsumer(
+            topic_name,
+            bootstrap_servers=['localhost:9092'],
+            group_id=group_id,
+            auto_offset_reset='earliest',
+            enable_auto_commit=True,
+            api_version=(0, 10, 0)
+        )
+        
+        print(f"✓ Joined consumer group '{group_id}'")
         
         # Try to consume
         messages = consumer.poll(timeout_ms=5000)

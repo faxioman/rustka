@@ -67,7 +67,7 @@ def produce_sentry_events():
             }
             topic = event_type + 's'
         
-        # Usa project come key per partizionamento
+        # Use project as key for partitioning
         producer.send(topic, key=project, value=event)
         print(f"Produced {event_type} event for project {project}")
         time.sleep(0.2)

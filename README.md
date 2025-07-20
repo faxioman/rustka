@@ -16,9 +16,10 @@ Rustka implements the core Kafka wire protocol APIs needed for most applications
 
 - Metadata with auto-topic creation
 - Produce/Fetch for message publishing and consumption  
-- Consumer Groups with coordination and offset management
+- Consumer Groups with proper rebalancing and offset management
 - ListOffsets for offset queries
 - Full API version negotiation
+- SASL/PLAIN authentication support
 
 ## Quick Start
 

@@ -273,7 +273,7 @@ def test_sentry_offset_tracking():
     return success
 
 def test_sentry_high_throughput():
-    """Test high throughput scenario tipico di Sentry"""
+    """Test high throughput scenario typical of Sentry"""
     print("\n3. Testing high throughput scenario...")
     
     num_events = 100

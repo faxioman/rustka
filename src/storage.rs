@@ -129,7 +129,6 @@ impl InMemoryStorage {
         let mut total_size = 0i32;
         let mut record_count = 0;
         
-        // Build a MessageSet with multiple messages
         while current_offset < high_watermark && total_size < max_bytes {
             let record_index = current_offset as usize;
             if record_index >= partition_data.records.len() {
@@ -138,7 +137,6 @@ impl InMemoryStorage {
             
             let record = &partition_data.records[record_index];
             
-            // Create a single message in MessageSet format
             let mut message = BytesMut::new();
             
             // Message format (v0/v1):
@@ -247,7 +245,6 @@ impl InMemoryStorage {
             
             let stored_record = &partition_data.records[record_index];
             
-            // Convert to kafka_protocol Record format
             let record = KafkaRecord {
                 transactional: false,
                 control: false,
@@ -293,7 +290,6 @@ impl InMemoryStorage {
         match RecordBatchEncoder::encode(&mut buf, &records, &options) {
             Ok(_) => Ok((high_watermark, Some(buf.freeze()))),
             Err(e) => {
-                eprintln!("Failed to encode RecordBatch: {:?}", e);
                 Ok((high_watermark, None))
             }
         }
