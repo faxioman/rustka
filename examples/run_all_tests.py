@@ -36,6 +36,7 @@ TEST_ORDER = [
     
     ("test_authentication.py", "SASL PLAIN authentication test"),
     
+    ("test_basic_rebalance.py", "Basic consumer group rebalancing"),
     ("test_arroyo_rebalance.py", "Arroyo/librdkafka consumer group rebalancing"),
 ]
 

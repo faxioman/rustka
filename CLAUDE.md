@@ -45,12 +45,17 @@ python3 examples/test_minimal.py
 ```
 
 ## Recent Work
-- Fixed consumer group protocol to properly handle rebalancing
-- Consumer groups now correctly:
-  - Elect a single leader per generation
-  - Distribute partitions among members
-  - Handle member joins/leaves with proper rebalancing
-  - Wait for members during rebalance (1 second timeout)
+- Fixed REBALANCE_IN_PROGRESS loop caused by librdkafka/Arroyo phantom members
+- The issue: librdkafka creates thousands of temporary connections during initialization
+  - Each connection joins as a new member but never completes the protocol
+  - This causes groups to accumulate 2000+ phantom members in seconds
+  - The broker waits forever for these members to rejoin, causing perpetual rebalancing
+- Solution: Aggressive cleanup of phantom members during JOIN_GROUP
+  - Members without recent heartbeats (>100ms) are removed during rebalancing
+  - Adaptive rebalance timing based on group size
+  - Limit on maximum members per group during rebalancing
+  - Prevents accumulation of temporary connections
+  - Allows real consumers to work despite phantom connection storm
 
 ## Important Notes
 
@@ -106,6 +111,7 @@ RUST_LOG=debug ./target/release/rustka
 - Avoid obvious comments like "// Increment counter" or "// Return result"
 - Prefer clear variable/function names over explanatory comments
 - Keep comments concise and meaningful when truly needed
+- **ALL COMMENTS MUST BE IN ENGLISH** - No Italian comments in code
 - **Test Guidelines**:
   - Python tests: ONLY for Kafka client integration testing
   - Rust tests: For all other testing (unit tests, internal logic, non-Kafka features)

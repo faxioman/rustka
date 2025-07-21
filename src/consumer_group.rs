@@ -125,6 +125,8 @@ impl ConsumerGroupManager {
         protocols: Vec<(String, Bytes)>,
     ) -> Result<JoinGroupResult, GroupError> {
         let is_new_member = member_id.is_none() || member_id.as_ref().map_or(false, |id| id.is_empty());
+        
+        
         let member_id = if is_new_member {
             self.generate_member_id(&client_id)
         } else {
@@ -208,17 +210,24 @@ impl ConsumerGroupManager {
                 debug!("Member {} attempting to join stable group {}", member_id, group_id);
                 
                 // Trigger rebalance for any join during stable state
+                debug!("Group {} moving from Stable to PreparingRebalance due to new member {}", group_id, member_id);
+                debug!("Existing members that need to rejoin: {:?}", group.members.keys().collect::<Vec<_>>());
+                
+                // Record who was in the group before rebalance
+                let existing_member_count = group.members.len();
+                
                 group.state = GroupState::PreparingRebalance;
                 group.generation_id += 1;
                 group.rebalance_start = Some(Instant::now());
                 
                 // CRITICAL: Do NOT clear existing members!
                 // Mark all existing members as needing to rejoin
-                for member in group.members.values_mut() {
+                for (existing_member_id, member) in group.members.iter_mut() {
                     member.assignment = None;
+                    debug!("Member {} needs to rejoin for generation {}", existing_member_id, group.generation_id);
                 }
                 
-                // Add or update the joining member
+                // Add the new member
                 let member = GroupMember {
                     _member_id: member_id.clone(),
                     _client_id: client_id,
@@ -233,11 +242,15 @@ impl ConsumerGroupManager {
                 group.members.insert(member_id.clone(), member);
                 self.member_to_group.insert(member_id.clone(), group_id.clone());
                 
+                debug!("Group {} now has {} members (was {}), waiting for all to rejoin", 
+                       group_id, group.members.len(), existing_member_count);
+                
                 // Return REBALANCE_IN_PROGRESS to trigger client rejoin
                 Err(GroupError::RebalanceInProgress)
             }
             GroupState::PreparingRebalance => {
                 debug!("Member {} joining group {} in PreparingRebalance state", member_id, group_id);
+                debug!("Current members before join: {:?}", group.members.keys().collect::<Vec<_>>());
                 
                 // Add or update member
                 let member = GroupMember {
@@ -259,26 +272,22 @@ impl ConsumerGroupManager {
                     .map(|start| start.elapsed())
                     .unwrap_or(Duration::from_secs(0));
                 
-                // Adaptive rebalance timing based on group size
-                let (min_wait, max_wait) = if group.members.len() > 50 {
-                    // Many members - complete quickly to avoid accumulating more
-                    (Duration::from_millis(10), Duration::from_millis(50))
-                } else if group.members.len() > 10 {
-                    // Medium group - moderate wait
-                    (Duration::from_millis(30), Duration::from_millis(150))
-                } else {
-                    // Small group - normal wait times
-                    (Duration::from_millis(50), Duration::from_millis(300))
-                };
+                // Kafka group.initial.rebalance.delay.ms (default 3 seconds)
+                let rebalance_delay = Duration::from_secs(3);
                 
-                // Complete if:
-                // 1. Maximum wait time exceeded
-                // 2. Minimum wait time passed AND we have at least one member
-                let should_complete = elapsed >= max_wait || 
-                                    (elapsed >= min_wait && group.members.len() >= 1);
+                // Complete rebalance after timeout
+                let should_complete = elapsed >= rebalance_delay;
                 
                 if should_complete {
-                    debug!("Completing rebalance for group {} with {} members", group_id, group.members.len());
+                    debug!("Completing rebalance for group {} with {} members after {}ms", 
+                           group_id, group.members.len(), elapsed.as_millis());
+                    debug!("Members in rebalance: {:?}", group.members.keys().collect::<Vec<_>>());
+                    
+                    // Only complete if we have at least one member
+                    if group.members.is_empty() {
+                        debug!("No members joined during rebalance, keeping group in PreparingRebalance");
+                        return Err(GroupError::RebalanceInProgress);
+                    }
                     
                     // Elect leader (first member by ID for determinism)
                     if let Some(leader_id) = group.members.keys().min().cloned() {
@@ -338,9 +347,13 @@ impl ConsumerGroupManager {
                     group.generation_id += 1;
                     group.rebalance_start = Some(Instant::now());
                     
-                    // Start fresh with just this member
-                    group.members.clear();
+                    // CRITICAL: Keep existing members - they need to rejoin!
+                    // Just clear their assignments
+                    for member in group.members.values_mut() {
+                        member.assignment = None;
+                    }
                     
+                    // Add the new member
                     let member = GroupMember {
                         _member_id: member_id.clone(),
                         _client_id: client_id,
@@ -596,18 +609,16 @@ impl ConsumerGroupManager {
             .collect()
     }
 
+
     pub fn check_expired_members(&mut self) {
         let now = Instant::now();
         let mut expired_members = Vec::new();
 
         for (group_id, group) in &self.groups {
-            // Check for expired members in ALL states, not just Stable
-            // This is critical to prevent phantom members during rebalancing
             for (member_id, member) in &group.members {
                 let timeout = Duration::from_millis(member.session_timeout_ms as u64);
-                // Use a shorter timeout during rebalancing to clean up faster
                 let effective_timeout = if group.state == GroupState::PreparingRebalance {
-                    timeout.min(Duration::from_secs(3)) // Max 3 seconds during rebalance
+                    timeout.min(Duration::from_secs(3))
                 } else {
                     timeout
                 };
@@ -623,25 +634,6 @@ impl ConsumerGroupManager {
             let _ = self.leave_group(&group_id, &member_id);
         }
         
-        // Also clean up groups with too many members (likely phantom members)
-        let mut groups_to_clean = Vec::new();
-        for (group_id, group) in &self.groups {
-            if group.members.len() > 100 {  // Suspicious number of members
-                debug!("Group {} has {} members - likely has phantom members", group_id, group.members.len());
-                groups_to_clean.push(group_id.clone());
-            }
-        }
-        
-        // Force rebalance for groups with too many members
-        for group_id in groups_to_clean {
-            if let Some(group) = self.groups.get_mut(&group_id) {
-                if group.state == GroupState::Stable {
-                    group.state = GroupState::PreparingRebalance;
-                    group.generation_id += 1;
-                    group.rebalance_start = Some(Instant::now());
-                }
-            }
-        }
     }
     
     /// Get the number of stored offsets (for monitoring)
