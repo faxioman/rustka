@@ -1,13 +1,15 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{Html, Json},
     routing::{get, post, Router},
 };
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::{timeout, sleep};
 use tower_http::cors::CorsLayer;
 use crate::metrics::{MetricsCollector, AllMetrics};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct DashboardState {
@@ -25,6 +27,7 @@ pub async fn start_dashboard(
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/metrics", get(metrics_handler))
+        .route("/api/metrics/poll", get(metrics_long_poll_handler))
         .route("/api/cleanup/empty-topics", post(cleanup_empty_topics_handler))
         .route("/api/cleanup/all-messages", post(cleanup_all_messages_handler))
         .route("/api/memory-stats", get(memory_stats_handler))
@@ -51,6 +54,86 @@ async fn metrics_handler(
 ) -> Result<Json<AllMetrics>, StatusCode> {
     let all_metrics = state.metrics.get_all_metrics().await;
     Ok(Json(all_metrics))
+}
+
+#[derive(Deserialize)]
+struct LongPollQuery {
+    last_update: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct MetricsWithTimestamp {
+    metrics: AllMetrics,
+    timestamp: u64,
+}
+
+async fn metrics_long_poll_handler(
+    State(state): State<DashboardState>,
+    Query(query): Query<LongPollQuery>,
+) -> Result<Json<MetricsWithTimestamp>, StatusCode> {
+    let _start_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    
+    // Maximum wait time for long polling (30 seconds)
+    let max_wait = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(100);
+    
+    let result = timeout(max_wait, async {
+        let mut last_metrics = if query.last_update.is_some() {
+            state.metrics.get_all_metrics().await
+        } else {
+            // First request, return immediately
+            return state.metrics.get_all_metrics().await;
+        };
+        
+        loop {
+            sleep(poll_interval).await;
+            let current_metrics = state.metrics.get_all_metrics().await;
+            
+            // Check if metrics have changed
+            if has_metrics_changed(&last_metrics, &current_metrics) {
+                return current_metrics;
+            }
+            
+            last_metrics = current_metrics;
+        }
+    }).await;
+    
+    let metrics = match result {
+        Ok(metrics) => metrics,
+        Err(_) => {
+            // Timeout - return current metrics
+            state.metrics.get_all_metrics().await
+        }
+    };
+    
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    
+    Ok(Json(MetricsWithTimestamp {
+        metrics,
+        timestamp,
+    }))
+}
+
+fn has_metrics_changed(old: &AllMetrics, new: &AllMetrics) -> bool {
+    // Compare key metrics to detect changes
+    old.broker.total_messages_produced != new.broker.total_messages_produced ||
+    old.broker.total_messages_fetched != new.broker.total_messages_fetched ||
+    old.broker.active_connections != new.broker.active_connections ||
+    old.broker.total_requests != new.broker.total_requests ||
+    old.broker.storage_total_messages != new.broker.storage_total_messages ||
+    old.topics.len() != new.topics.len() ||
+    old.consumer_groups.len() != new.consumer_groups.len() ||
+    // Check if any topic message counts changed
+    old.topics.iter().any(|(topic_name, topic_metrics)| {
+        new.topics.get(topic_name)
+            .map_or(true, |new_topic| new_topic.total_messages != topic_metrics.total_messages)
+    })
 }
 
 #[derive(Serialize)]

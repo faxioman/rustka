@@ -115,9 +115,11 @@ def sentry_consumer_worker(worker_id, topics, group_id='sentry-consumers'):
             
             # Simulate saving to database, sending notifications, etc.
             if event_type == 'error':
-                print(f"  -> Stored error: {event['exception']['value']}")
+                if 'exception' in event and 'value' in event['exception']:
+                    print(f"  -> Stored error: {event['exception']['value']}")
             elif event_type == 'transaction':
-                print(f"  -> Recorded transaction: {event['transaction']} ({event['duration']:.2f}ms)")
+                if 'transaction' in event and 'duration' in event:
+                    print(f"  -> Recorded transaction: {event['transaction']} ({event['duration']:.2f}ms)")
                 
     except KeyboardInterrupt:
         pass

@@ -650,9 +650,14 @@ async fn handle_produce(
                                 debug!("Stored message {} at offset {}", i, offset);
                             }
                         } else {
-                            let records_copy = Bytes::copy_from_slice(records.as_ref());
-                            base_offset = storage.append_records(&topic_name, partition, None, records_copy);
-                            message_count = 1;
+                            error!("Failed to parse any messages from RecordBatch/MessageSet for topic '{}' partition {}", topic_name, partition);
+                            // Don't store raw bytes, return error
+                            let mut partition_response = PartitionProduceResponse::default();
+                            partition_response.index = partition;
+                            partition_response.error_code = 2; // CORRUPT_MESSAGE
+                            partition_response.base_offset = -1;
+                            partition_responses.push(partition_response);
+                            continue;
                         }
                     }
                 } else {
@@ -669,9 +674,14 @@ async fn handle_produce(
                             debug!("Stored message {} at offset {}", i, offset);
                         }
                     } else {
-                        let records_copy = Bytes::copy_from_slice(records.as_ref());
-                        base_offset = storage.append_records(&topic_name, partition, None, records_copy);
-                        message_count = 1;
+                        error!("Failed to parse any messages from MessageSet for topic '{}' partition {}", topic_name, partition);
+                        // Don't store raw bytes, return error
+                        let mut partition_response = PartitionProduceResponse::default();
+                        partition_response.index = partition;
+                        partition_response.error_code = 2; // CORRUPT_MESSAGE
+                        partition_response.base_offset = -1;
+                        partition_responses.push(partition_response);
+                        continue;
                     }
                 }
                 

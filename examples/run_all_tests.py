@@ -35,6 +35,8 @@ TEST_ORDER = [
     ("test_snuba_compatibility.py", "Snuba commit log compatibility"),
     
     ("test_authentication.py", "SASL PLAIN authentication test"),
+    
+    ("test_arroyo_rebalance.py", "Arroyo/librdkafka consumer group rebalancing"),
 ]
 
 def run_test(test_file, description):

@@ -54,8 +54,7 @@
         }
         
         .metric-card:hover {
-            border-color: #58a6ff;
-            box-shadow: 0 0 0 1px #58a6ff;
+            /* Hover effect removed to prevent flickering */
         }
         
         .metric-card h3 {
@@ -133,13 +132,6 @@
         .status-empty {
             background-color: #da3633;
             color: #ffffff;
-        }
-        
-        .refresh-info {
-            text-align: center;
-            color: #8b949e;
-            margin-top: 20px;
-            font-size: 0.9em;
         }
         
         .loading {
@@ -275,15 +267,9 @@
         <div id="content">
             <div class="loading">Loading metrics...</div>
         </div>
-        
-        <div class="refresh-info">
-            Auto-refreshing every 2 seconds
-        </div>
     </div>
     
     <script>
-        let refreshInterval;
-        
         function formatUptime(seconds) {
             const hours = Math.floor(seconds / 3600);
             const minutes = Math.floor((seconds % 3600) / 60);
@@ -316,6 +302,115 @@
                 case 'awaitingsync': return 'status-rebalancing';
                 case 'empty': return 'status-empty';
                 default: return '';
+            }
+        }
+        
+        // Helper functions for table rendering
+        function renderTopicsTable(tbody, topics) {
+            const topicNames = Object.keys(topics).sort();
+            tbody.innerHTML = topicNames.map(topicName => {
+                const topic = topics[topicName];
+                return `
+                    <tr>
+                        <td>${topicName}</td>
+                        <td>${topic.partitions.length}</td>
+                        <td>${topic.total_messages.toLocaleString()}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        function renderGroupsTable(tbody, groups) {
+            const groupIds = Object.keys(groups).sort();
+            tbody.innerHTML = groupIds.map(groupId => {
+                const group = groups[groupId];
+                return `
+                    <tr>
+                        <td>${groupId}</td>
+                        <td>${group.state}</td>
+                        <td>${group.members_count}</td>
+                        <td>${group.generation_id}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+        
+        // Check if metrics structure exists
+        function metricsStructureExists() {
+            return document.querySelector('.metrics-grid') !== null;
+        }
+        
+        // Update only the values without recreating DOM
+        function updateMetricsValues(data) {
+            // Update broker metrics
+            const uptimeEl = document.querySelector('[data-metric="uptime"]');
+            if (uptimeEl) uptimeEl.textContent = formatUptime(data.broker.uptime_seconds);
+            
+            const connectionsEl = document.querySelector('[data-metric="connections"]');
+            if (connectionsEl) connectionsEl.textContent = data.broker.active_connections;
+            
+            const messagesProducedEl = document.querySelector('[data-metric="messages-produced"]');
+            if (messagesProducedEl) messagesProducedEl.textContent = data.broker.total_messages_produced.toLocaleString();
+            
+            const messagesFetchedEl = document.querySelector('[data-metric="messages-fetched"]');
+            if (messagesFetchedEl) messagesFetchedEl.textContent = data.broker.total_messages_fetched.toLocaleString();
+            
+            const topicsCountEl = document.querySelector('[data-metric="topics-count"]');
+            if (topicsCountEl) topicsCountEl.textContent = Object.keys(data.topics).length;
+            
+            const groupsCountEl = document.querySelector('[data-metric="groups-count"]');
+            if (groupsCountEl) groupsCountEl.textContent = Object.keys(data.consumer_groups).length;
+            
+            // Update storage stats
+            const storageMsgsEl = document.querySelector('[data-metric="storage-messages"]');
+            if (storageMsgsEl) storageMsgsEl.textContent = (data.broker.storage_total_messages || 0).toLocaleString();
+            
+            const storagePartitionsEl = document.querySelector('[data-metric="storage-partitions"]');
+            if (storagePartitionsEl) storagePartitionsEl.textContent = data.broker.storage_total_partitions || 0;
+            
+            // Update topics table if structure hasn't changed
+            const topicsTableBody = document.querySelector('#topics-table-body');
+            if (topicsTableBody) {
+                const existingRows = topicsTableBody.querySelectorAll('tr');
+                const topicNames = Object.keys(data.topics).sort();
+                
+                // Only recreate if topic count changed
+                if (existingRows.length !== topicNames.length) {
+                    renderTopicsTable(topicsTableBody, data.topics);
+                } else {
+                    // Update values in existing rows
+                    topicNames.forEach((topicName, index) => {
+                        const row = existingRows[index];
+                        if (row) {
+                            const cells = row.querySelectorAll('td');
+                            const topic = data.topics[topicName];
+                            if (cells[1]) cells[1].textContent = topic.partitions.length;
+                            if (cells[2]) cells[2].textContent = topic.total_messages.toLocaleString();
+                        }
+                    });
+                }
+            }
+            
+            // Update consumer groups table similarly
+            const groupsTableBody = document.querySelector('#groups-table-body');
+            if (groupsTableBody) {
+                const existingRows = groupsTableBody.querySelectorAll('tr');
+                const groupNames = Object.keys(data.consumer_groups).sort();
+                
+                if (existingRows.length !== groupNames.length) {
+                    renderGroupsTable(groupsTableBody, data.consumer_groups);
+                } else {
+                    groupNames.forEach((groupId, index) => {
+                        const row = existingRows[index];
+                        if (row) {
+                            const cells = row.querySelectorAll('td');
+                            const group = data.consumer_groups[groupId];
+                            if (cells[1]) cells[1].textContent = group.state;
+                            if (cells[2]) cells[2].textContent = group.members_count;
+                            if (cells[3]) cells[3].textContent = group.generation_id;
+                        }
+                    });
+                }
             }
         }
         
@@ -382,7 +477,7 @@
                                     <th>Partition Details</th>
                                 </tr>
                             </thead>
-                            <tbody>
+                            <tbody id="topics-table-body">
                                 ${Object.values(data.topics).map(topic => `
                                     <tr>
                                         <td><strong>${topic.name}</strong></td>
@@ -417,7 +512,7 @@
                                     <th>Leader ID</th>
                                 </tr>
                             </thead>
-                            <tbody>
+                            <tbody id="groups-table-body">
                                 ${Object.values(data.consumer_groups).map(group => `
                                     <tr>
                                         <td><strong>${group.group_id}</strong></td>
@@ -452,6 +547,9 @@
             content.innerHTML = html;
         }
         
+        let lastUpdateTimestamp = null;
+        let longPollAbortController = null;
+        
         async function fetchMetrics() {
             try {
                 const response = await fetch('/api/metrics');
@@ -470,16 +568,58 @@
             }
         }
         
-        // Initial load
-        fetchMetrics();
+        async function longPollMetrics() {
+            while (true) {
+                try {
+                    // Create abort controller for this request
+                    longPollAbortController = new AbortController();
+                    
+                    // Build URL with last update timestamp
+                    const url = lastUpdateTimestamp 
+                        ? `/api/metrics/poll?last_update=${lastUpdateTimestamp}`
+                        : '/api/metrics/poll';
+                    
+                    const response = await fetch(url, {
+                        signal: longPollAbortController.signal
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const data = await response.json();
+                    lastUpdateTimestamp = data.timestamp;
+                    renderMetrics(data.metrics);
+                    
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        console.log('Long poll aborted');
+                        break;
+                    }
+                    
+                    console.error('Error in long poll:', error);
+                    document.getElementById('content').innerHTML = `
+                        <div class="error">
+                            Failed to fetch metrics: ${error.message}
+                        </div>
+                    `;
+                    
+                    // Wait before retrying on error
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+            }
+        }
         
-        // Refresh every 2 seconds
-        refreshInterval = setInterval(fetchMetrics, 2000);
+        // Initial load with regular fetch
+        fetchMetrics().then(() => {
+            // Start long polling after initial load
+            longPollMetrics();
+        });
         
         // Clean up on page unload
         window.addEventListener('beforeunload', () => {
-            if (refreshInterval) {
-                clearInterval(refreshInterval);
+            if (longPollAbortController) {
+                longPollAbortController.abort();
             }
         });
         
@@ -495,8 +635,12 @@
                 const result = await response.json();
                 showCleanupResult(result);
                 
-                // Refresh metrics after cleanup
-                setTimeout(fetchMetrics, 500);
+                // Force immediate metrics refresh by breaking timestamp
+                lastUpdateTimestamp = 0;
+                // Wait a bit for cleanup to propagate
+                setTimeout(() => {
+                    lastUpdateTimestamp = null;
+                }, 100);
             } catch (error) {
                 showCleanupResult({
                     success: false,
@@ -521,8 +665,12 @@
                 const result = await response.json();
                 showCleanupResult(result);
                 
-                // Refresh metrics after cleanup
-                setTimeout(fetchMetrics, 500);
+                // Force immediate metrics refresh by breaking timestamp
+                lastUpdateTimestamp = 0;
+                // Wait a bit for cleanup to propagate
+                setTimeout(() => {
+                    lastUpdateTimestamp = null;
+                }, 100);
             } catch (error) {
                 showCleanupResult({
                     success: false,

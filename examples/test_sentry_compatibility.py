@@ -40,7 +40,7 @@ def test_sentry_event_processing():
                 group_id=group_id,
                 auto_offset_reset='earliest',
                 enable_auto_commit=False,  # Manual commit for debugging
-                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
                 api_version=(0, 10, 0),
                 max_poll_records=500
             )
@@ -323,7 +323,7 @@ def test_sentry_high_throughput():
         fetch_min_bytes=1,  # Don't wait for more bytes
         fetch_max_wait_ms=10,  # Reduce wait time
         max_poll_records=500,  # Get more records per poll
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+        value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
         api_version=(0, 10, 0)
     )
     
