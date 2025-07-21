@@ -110,3 +110,8 @@ RUST_LOG=debug ./target/release/rustka
   - Python tests: ONLY for Kafka client integration testing
   - Rust tests: For all other testing (unit tests, internal logic, non-Kafka features)
   - Dashboard tests, retention tests, etc. should be in Rust, not Python
+  - If tests have issues with corrupt/invalid data, the test MUST fail - don't hide errors in tests
+
+## Important Rules
+- **NEVER make git commits** - The user will ALWAYS make commits themselves when they decide
+- **NEVER hide test failures** - If something is wrong, tests must fail visibly
