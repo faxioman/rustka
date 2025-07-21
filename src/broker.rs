@@ -1,5 +1,6 @@
 use crate::storage::InMemoryStorage;
 use crate::consumer_group::{ConsumerGroupManager, GroupError};
+use crate::metrics::MetricsCollector;
 use bytes::{BytesMut, Bytes, Buf};
 use kafka_protocol::messages::{
     BrokerId, TopicName,
@@ -52,12 +53,10 @@ struct ConnectionState {
 }
 
 fn get_advertised_host() -> String {
-    // First check environment variable
     if let Ok(host) = env::var("KAFKA_ADVERTISED_HOST") {
         return host;
     }
     
-    // Try to get the local IP address
     match local_ip() {
         Ok(ip) => ip.to_string(),
         Err(e) => {
@@ -69,23 +68,31 @@ fn get_advertised_host() -> String {
 
 pub struct KafkaBroker {
     addr: String,
-    storage: Arc<Mutex<InMemoryStorage>>,
-    group_manager: Arc<Mutex<ConsumerGroupManager>>,
+    pub storage: Arc<Mutex<InMemoryStorage>>,
+    pub group_manager: Arc<Mutex<ConsumerGroupManager>>,
     broker_id: BrokerId,
+    metrics: Arc<MetricsCollector>,
 }
 
 impl KafkaBroker {
+    #[allow(dead_code)]
     pub fn new(addr: impl Into<String>) -> Self {
+        let metrics = Arc::new(MetricsCollector::new());
+        Self::new_with_metrics(addr, metrics)
+    }
+    
+    pub fn new_with_metrics(addr: impl Into<String>, metrics: Arc<MetricsCollector>) -> Self {
         let storage = Arc::new(Mutex::new(InMemoryStorage::new()));
-        let group_manager = Arc::new(Mutex::new(
-            ConsumerGroupManager::new_with_storage(storage.clone())
-        ));
+        let mut consumer_group_manager = ConsumerGroupManager::new_with_storage(storage.clone());
+        consumer_group_manager.set_metrics(metrics.clone());
+        let group_manager = Arc::new(Mutex::new(consumer_group_manager));
         
         Self {
             addr: addr.into(),
             storage,
             group_manager,
             broker_id: BrokerId(0),
+            metrics,
         }
     }
 
@@ -93,7 +100,6 @@ impl KafkaBroker {
         let listener = TcpListener::bind(&self.addr).await?;
         info!("Kafka broker listening on {}", self.addr);
 
-        // Spawn task to check expired members
         let group_manager_clone = self.group_manager.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -101,6 +107,28 @@ impl KafkaBroker {
                 interval.tick().await;
                 let mut manager = group_manager_clone.lock().await;
                 manager.check_expired_members();
+                manager.cleanup_orphaned_offsets();
+            }
+        });
+        
+        let storage_clone = self.storage.clone();
+        let metrics_clone = self.metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                
+                let mut storage = storage_clone.lock().await;
+                storage.cleanup_old_messages();
+                let stats = storage.get_storage_stats();
+                let topics = storage.get_all_topics();
+                drop(storage);
+                
+                metrics_clone.update_storage_stats(stats).await;
+                
+                metrics_clone.cleanup_topic_metrics(&topics).await;
+                
+                // Note: We do NOT automatically cleanup consumer groups as this could break clients
             }
         });
 
@@ -111,11 +139,15 @@ impl KafkaBroker {
             let storage = self.storage.clone();
             let group_manager = self.group_manager.clone();
             let broker_id = self.broker_id;
+            let metrics = self.metrics.clone();
+            
+            metrics.increment_connections().await;
             
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, storage, group_manager, broker_id).await {
+                if let Err(e) = handle_connection(socket, storage, group_manager, broker_id, metrics.clone()).await {
                     error!("Connection error: {}", e);
                 }
+                metrics.decrement_connections().await;
             });
         }
     }
@@ -126,6 +158,7 @@ async fn handle_connection(
     storage: Arc<Mutex<InMemoryStorage>>,
     group_manager: Arc<Mutex<ConsumerGroupManager>>,
     _broker_id: BrokerId,
+    metrics: Arc<MetricsCollector>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let peer_addr = socket.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
     let mut size_buf = [0u8; 4];
@@ -134,6 +167,9 @@ async fn handle_connection(
         username: None,
     };
     let mut expecting_raw_sasl_auth = false;
+
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+    let mut message_buf = Vec::with_capacity(65536);
 
     loop {
         if socket.read_exact(&mut size_buf).await.is_err() {
@@ -144,14 +180,19 @@ async fn handle_connection(
         let size = i32::from_be_bytes(size_buf) as usize;
         debug!("Incoming message size: {}", size);
 
-        // Handle raw SASL auth bytes (legacy format)
+        if size > MAX_MESSAGE_SIZE {
+            error!("Message size {} exceeds maximum allowed size {}", size, MAX_MESSAGE_SIZE);
+            break;
+        }
+
         if expecting_raw_sasl_auth {
             debug!("Expecting raw SASL auth bytes of size {}", size);
-            let mut auth_buf = vec![0u8; size];
-            socket.read_exact(&mut auth_buf).await?;
+            if message_buf.len() < size {
+                message_buf.resize(size, 0);
+            }
+            socket.read_exact(&mut message_buf[..size]).await?;
             
-            // Parse PLAIN auth format: \0username\0password
-            let auth_str = String::from_utf8_lossy(&auth_buf);
+            let auth_str = String::from_utf8_lossy(&message_buf[..size]);
             let parts: Vec<&str> = auth_str.split('\0').collect();
             if parts.len() >= 3 {
                 let username = parts[1];
@@ -161,7 +202,6 @@ async fn handle_connection(
                 info!("Authentication successful for user: {}", username);
             }
             
-            // Send raw response: 4 bytes size + empty payload
             let response_size = 0i32;
             socket.write_all(&response_size.to_be_bytes()).await?;
             socket.flush().await?;
@@ -170,12 +210,20 @@ async fn handle_connection(
             continue;
         }
 
-        let mut message_buf = vec![0u8; size];
-        socket.read_exact(&mut message_buf).await?;
+        if message_buf.len() < size {
+            message_buf.resize(size, 0);
+        }
         
-        let mut buf = BytesMut::from(&message_buf[..]);
+        if message_buf.capacity() > 1_048_576 && size < 65536 {
+            message_buf = Vec::with_capacity(65536);
+            message_buf.resize(size, 0);
+        }
         
-        // Debug output for protocol analysis
+        socket.read_exact(&mut message_buf[..size]).await?;
+        
+        let mut buf = BytesMut::with_capacity(size);
+        buf.extend_from_slice(&message_buf[..size]);
+        
         if size >= 8 {
             let api_key = i16::from_be_bytes([message_buf[0], message_buf[1]]);
             let api_version = i16::from_be_bytes([message_buf[2], message_buf[3]]);
@@ -188,18 +236,18 @@ async fn handle_connection(
             }
         }
         
-        // kafka-python uses header v1 which includes client_id
         let header = RequestHeader::decode(&mut buf, 1)?;
         debug!("Parsed header: api_key={}, version={}, correlation_id={}, client_id={:?}, remaining_bytes={}", 
                header.request_api_key, header.request_api_version, header.correlation_id, 
                header.client_id, buf.remaining());
 
-        // Handle request based on API key
+        metrics.increment_requests().await;
+        
         let response_result = match header.request_api_key {
             18 => Ok((handle_api_versions(&header).await?, false)), // ApiVersions
             3 => Ok((handle_metadata(&header, &mut buf, storage.clone()).await?, false)), // Metadata
-            0 => Ok((handle_produce(&header, &mut buf, storage.clone()).await?, false)), // Produce
-            1 => Ok((handle_fetch(&header, &mut buf, storage.clone()).await?, false)), // Fetch
+            0 => Ok((handle_produce(&header, &mut buf, storage.clone(), metrics.clone()).await?, false)), // Produce
+            1 => Ok((handle_fetch(&header, &mut buf, storage.clone(), metrics.clone()).await?, false)), // Fetch
             2 => Ok((handle_list_offsets(&header, &mut buf, storage.clone()).await?, false)), // ListOffsets
             10 => Ok((handle_find_coordinator(&header, &mut buf, group_manager.clone()).await?, false)), // FindCoordinator
             11 => Ok((handle_join_group(&header, &mut buf, group_manager.clone(), &peer_addr).await?, false)), // JoinGroup
@@ -240,15 +288,29 @@ async fn handle_connection(
 // Parse RecordBatch (magic byte 2) and extract messages with key, value and headers
 fn parse_record_batch(data: &Bytes) -> Vec<(Option<Bytes>, Bytes, IndexMap<StrBytes, Option<Bytes>>)> {
     let mut messages = Vec::new();
-    let mut buf = data.clone();
+    let data_copy = Bytes::copy_from_slice(data.as_ref());
+    let mut buf = data_copy;
     
-    // Try to decode as RecordBatch
     match RecordBatchDecoder::decode(&mut buf) {
         Ok(record_set) => {
             debug!("Decoded RecordBatch with {} records", record_set.records.len());
             
             for record in record_set.records {
-                messages.push((record.key, record.value.unwrap_or(Bytes::new()), record.headers));
+                let key = record.key.map(|k| Bytes::copy_from_slice(&k));
+                let value = record.value.unwrap_or(Bytes::new());
+                let value_copy = if value.is_empty() {
+                    value
+                } else {
+                    Bytes::copy_from_slice(&value)
+                };
+                
+                let mut headers_copy = IndexMap::new();
+                for (k, v) in record.headers {
+                    let v_copy = v.map(|val| Bytes::copy_from_slice(&val));
+                    headers_copy.insert(k, v_copy);
+                }
+                
+                messages.push((key, value_copy, headers_copy));
             }
         }
         Err(e) => {
@@ -259,7 +321,6 @@ fn parse_record_batch(data: &Bytes) -> Vec<(Option<Bytes>, Bytes, IndexMap<StrBy
     messages
 }
 
-// Parse a MessageSet and extract individual messages with key and value
 fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
     let mut messages = Vec::new();
     let mut offset = 0;
@@ -268,14 +329,12 @@ fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
     debug!("Parsing MessageSet of {} bytes", data_slice.len());
     
     while offset + 12 <= data_slice.len() {
-        // Read message offset (8 bytes)
         let msg_offset = i64::from_be_bytes([
             data_slice[offset], data_slice[offset+1], data_slice[offset+2], data_slice[offset+3],
             data_slice[offset+4], data_slice[offset+5], data_slice[offset+6], data_slice[offset+7]
         ]);
         offset += 8;
         
-        // Read message size (4 bytes)
         let msg_size = i32::from_be_bytes([
             data_slice[offset], data_slice[offset+1], data_slice[offset+2], data_slice[offset+3]
         ]) as usize;
@@ -288,25 +347,15 @@ fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
             break;
         }
         
-        // Parse the message to extract the value
         let msg_data = &data_slice[offset..offset + msg_size];
         offset += msg_size;
         
-        // Message format:
-        // CRC (4 bytes)
-        // Magic (1 byte)
-        // Attributes (1 byte)
-        // Key length (4 bytes) - can be -1 for null
-        // Key (variable) - absent if key length is -1
-        // Value length (4 bytes)
-        // Value (variable)
-        
-        if msg_data.len() < 14 {  // Minimum size for a message with null key
+        if msg_data.len() < 14 {
             debug!("Message too short, skipping");
             continue;
         }
         
-        let mut msg_offset = 4; // Skip CRC
+        let mut msg_offset = 4;
         let magic = msg_data[msg_offset];
         msg_offset += 1;
         let _attributes = msg_data[msg_offset];
@@ -314,9 +363,7 @@ fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
         
         debug!("Message: magic={}, attributes={}, msg_len={}", magic, _attributes, msg_data.len());
         
-        // For magic byte 1, there's a timestamp field
         if magic == 1 {
-            // Skip timestamp (8 bytes)
             if msg_offset + 8 > msg_data.len() {
                 debug!("Can't read timestamp, skipping");
                 continue;
@@ -324,7 +371,6 @@ fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
             msg_offset += 8;
         }
         
-        // Read key length
         if msg_offset + 4 > msg_data.len() {
             debug!("Can't read key length, skipping");
             continue;
@@ -336,20 +382,23 @@ fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
         ]);
         msg_offset += 4;
 
-        // Extract key if present
         let key = if key_len >= 0 {
             if msg_offset + key_len as usize > msg_data.len() {
                 debug!("Key truncated, skipping");
                 continue;
             }
-            let key_data = &msg_data[msg_offset..msg_offset + key_len as usize];
+            let key_start = offset - msg_size + msg_offset;
+            let key_end = key_start + key_len as usize;
             msg_offset += key_len as usize;
-            Some(Bytes::copy_from_slice(key_data))
+            if key_len < 1024 {
+                Some(Bytes::copy_from_slice(&data[key_start..key_end]))
+            } else {
+                Some(data.slice(key_start..key_end))
+            }
         } else {
             None
         };
         
-        // Read value length
         if msg_offset + 4 > msg_data.len() {
             debug!("Can't read value length, skipping");
             continue;
@@ -361,11 +410,12 @@ fn parse_message_set(data: &Bytes) -> Vec<(Option<Bytes>, Bytes)> {
         ]);
         msg_offset += 4;
         
-        // Extract value
         if value_len >= 0 && msg_offset + value_len as usize <= msg_data.len() {
-            let value = &msg_data[msg_offset..msg_offset + value_len as usize];
+            let value_start = offset - msg_size + msg_offset;
+            let value_end = value_start + value_len as usize;
             let key_len_for_debug = key.as_ref().map(|k| k.len()).unwrap_or(0);
-            messages.push((key, Bytes::copy_from_slice(value)));
+            let value = Bytes::copy_from_slice(&data[value_start..value_end]);
+            messages.push((key, value));
             debug!("Extracted message: key={} bytes, value={} bytes", 
                    key_len_for_debug, value_len);
         } else {
@@ -384,13 +434,12 @@ async fn handle_api_versions(
     
     let mut api_versions = Vec::new();
     
-    // Supported API - declare support for all versions we actually implement
     let supported_apis = vec![
-        (18, 0, 4),  // ApiVersions - support all versions
+        (18, 0, 4),  // ApiVersions
         (3, 0, 2),   // Metadata
         (0, 0, 2),   // Produce
         (1, 0, 3),   // Fetch
-        (2, 0, 1),   // ListOffsets - MISSING! Added now
+        (2, 0, 1),   // ListOffsets
         (10, 0, 1),  // FindCoordinator
         (11, 0, 2),  // JoinGroup
         (14, 0, 1),  // SyncGroup
@@ -410,19 +459,15 @@ async fn handle_api_versions(
         api_versions.push(v);
     }
     
-    // Build response with all required fields
     let mut response = ApiVersionsResponse::default()
         .with_error_code(0)
         .with_api_keys(api_versions);
         
-    // Add throttle_time_ms for v1+
     if header.request_api_version >= 1 {
         response = response.with_throttle_time_ms(0);
     }
     
-    // For v3+, we need to handle additional fields properly
     if header.request_api_version >= 3 {
-        // Set default values for v3+ fields
         response = response
             .with_supported_features(vec![])
             .with_finalized_features_epoch(-1)
@@ -435,10 +480,7 @@ async fn handle_api_versions(
 
     let mut buf = BytesMut::new();
     
-    // ApiVersionsResponse always uses header version 0
     response_header.encode(&mut buf, 0)?;
-    
-    // Encode the response with the requested version
     response.encode(&mut buf, header.request_api_version)?;
     
     debug!("ApiVersions response for v{}: {} bytes", header.request_api_version, buf.len());
@@ -453,13 +495,11 @@ async fn handle_metadata(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     debug!("Handling Metadata request version {}", header.request_api_version);
     
-    // Debug: show remaining bytes
     if buf.remaining() > 0 {
         let remaining_bytes: Vec<u8> = buf.chunk().iter().take(40).copied().collect();
         debug!("Remaining bytes in buffer: {:?} (total: {})", remaining_bytes, buf.remaining());
     }
     
-    // Try to decode the request
     let request = match MetadataRequest::decode(buf, header.request_api_version) {
         Ok(req) => req,
         Err(e) => {
@@ -472,7 +512,6 @@ async fn handle_metadata(
     
     let mut topics = Vec::new();
     
-    // If topics is None, return metadata for all topics
     let topic_names: Vec<String> = if let Some(req_topics) = request.topics {
         req_topics.into_iter()
             .filter_map(|t| t.name.map(|n| n.to_string()))
@@ -486,11 +525,8 @@ async fn handle_metadata(
         
         debug!("Topic '{}' has {} partitions", topic_name, partitions.len());
         
-        // Create missing topic with 3 fixed partition
         if partitions.is_empty() && !topic_name.is_empty() {
             debug!("Auto-creating topic '{}' with 3 partitions", topic_name);
-            // We cannot modify storage here because it's immutable
-            // We use 3 fixed partition
             let default_partitions = vec![0, 1, 2];
             
             let mut topic = MetadataResponseTopic::default();
@@ -561,6 +597,7 @@ async fn handle_produce(
     header: &RequestHeader,
     buf: &mut BytesMut,
     storage: Arc<Mutex<InMemoryStorage>>,
+    metrics: Arc<MetricsCollector>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     debug!("Handling Produce request version {}", header.request_api_version);
     
@@ -570,75 +607,77 @@ async fn handle_produce(
     debug!("Produce request has {} topics", request.topic_data.len());
     
     let mut responses = Vec::new();
+    let mut total_messages_produced = 0u64;
     
-    for topic_data in request.topic_data {
+    for topic_data in &request.topic_data {
         let topic_name = topic_data.name.to_string();
         let mut partition_responses = Vec::new();
         
-        for partition_data in topic_data.partition_data {
+        for partition_data in &topic_data.partition_data {
             let partition = partition_data.index;
             
-            // Decode the records
-            if let Some(records) = partition_data.records {
-                // Debug: print first 100 bytes of records
+            if let Some(records) = &partition_data.records {
                 let preview = &records.as_ref()[..std::cmp::min(100, records.len())];
                 debug!("Records preview (first {} bytes): {:?}", preview.len(), preview);
                 
-                // For API version <= 1, records are in MessageSet format
-                // For API version >= 2, records are in RecordBatch format
                 let mut base_offset = 0i64;
+                let message_count: u64;
                 
-                // Try to parse as RecordBatch first (for API v3+)
                 if header.request_api_version >= 3 {
                     let batch_messages = parse_record_batch(&records);
                     if !batch_messages.is_empty() {
                         debug!("Extracted {} messages from RecordBatch", batch_messages.len());
-                        for (i, (key, value, headers)) in batch_messages.iter().enumerate() {
-                            let offset = storage.append_records_with_headers(&topic_name, partition, key.clone(), value.clone(), headers.clone());
+                        message_count = batch_messages.len() as u64;
+                        for (i, (key, value, headers)) in batch_messages.into_iter().enumerate() {
+                            let headers_count = headers.len();
+                            let offset = storage.append_records_with_headers(&topic_name, partition, key, value, headers);
                             if i == 0 {
                                 base_offset = offset;
                             }
-                            debug!("Stored message {} at offset {} with {} headers", i, offset, headers.len());
+                            debug!("Stored message {} at offset {} with {} headers", i, offset, headers_count);
                         }
                     } else {
-                        // Fall back to MessageSet format if RecordBatch parsing fails
                         let messages = parse_message_set(&records);
                         debug!("Extracted {} messages from MessageSet (fallback)", messages.len());
                         
                         if !messages.is_empty() {
-                            for (i, (key, value)) in messages.iter().enumerate() {
-                                let offset = storage.append_records(&topic_name, partition, key.clone(), value.clone());
+                            message_count = messages.len() as u64;
+                            for (i, (key, value)) in messages.into_iter().enumerate() {
+                                let offset = storage.append_records(&topic_name, partition, key, value);
                                 if i == 0 {
                                     base_offset = offset;
                                 }
                                 debug!("Stored message {} at offset {}", i, offset);
                             }
                         } else {
-                            // If no messages were parsed, store the raw data as fallback
-                            base_offset = storage.append_records(&topic_name, partition, None, records);
+                            let records_copy = Bytes::copy_from_slice(records.as_ref());
+                            base_offset = storage.append_records(&topic_name, partition, None, records_copy);
+                            message_count = 1;
                         }
                     }
                 } else {
-                    // Parse MessageSet format (used in API v0, v1, v2)
                     let messages = parse_message_set(&records);
                     debug!("Extracted {} messages from MessageSet", messages.len());
                     
                     if !messages.is_empty() {
-                        // Store each message individually with key and value
-                        for (i, (key, value)) in messages.iter().enumerate() {
-                            let offset = storage.append_records(&topic_name, partition, key.clone(), value.clone());
+                        message_count = messages.len() as u64;
+                        for (i, (key, value)) in messages.into_iter().enumerate() {
+                            let offset = storage.append_records(&topic_name, partition, key, value);
                             if i == 0 {
                                 base_offset = offset;
                             }
                             debug!("Stored message {} at offset {}", i, offset);
                         }
                     } else {
-                        // If no messages were parsed, store the raw data as fallback
-                        base_offset = storage.append_records(&topic_name, partition, None, records);
+                        let records_copy = Bytes::copy_from_slice(records.as_ref());
+                        base_offset = storage.append_records(&topic_name, partition, None, records_copy);
+                        message_count = 1;
                     }
                 }
                 
                 debug!("Produced to topic={}, partition={}, base_offset={}", topic_name, partition, base_offset);
+                
+                let _high_watermark = base_offset + message_count as i64;
                 
                 let mut partition_response = PartitionProduceResponse::default();
                 partition_response.index = partition;
@@ -648,6 +687,7 @@ async fn handle_produce(
                 partition_response.log_start_offset = 0;
                 
                 partition_responses.push(partition_response);
+                total_messages_produced += message_count;
             }
         }
         
@@ -656,6 +696,27 @@ async fn handle_produce(
         topic_response.partition_responses = partition_responses;
         
         responses.push(topic_response);
+    }
+    
+    let mut topic_metrics_updates = Vec::new();
+    for topic_data in &request.topic_data {
+        let topic_name = topic_data.name.to_string();
+        for partition_data in &topic_data.partition_data {
+            let partition = partition_data.index;
+            if let Ok(hw) = storage.get_high_watermark(&topic_name, partition) {
+                topic_metrics_updates.push((topic_name.clone(), partition, hw));
+            }
+        }
+    }
+    
+    drop(storage);
+    
+    if total_messages_produced > 0 {
+        metrics.increment_messages_produced(total_messages_produced).await;
+    }
+    
+    for (topic, partition, high_watermark) in topic_metrics_updates {
+        metrics.update_topic_metrics(topic, partition, high_watermark).await;
     }
     
     let mut response = ProduceResponse::default();
@@ -676,6 +737,7 @@ async fn handle_fetch(
     header: &RequestHeader,
     buf: &mut BytesMut,
     storage: Arc<Mutex<InMemoryStorage>>,
+    metrics: Arc<MetricsCollector>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     debug!("Handling Fetch request v{}", header.request_api_version);
     
@@ -683,6 +745,7 @@ async fn handle_fetch(
     let storage = storage.lock().await;
     
     let mut responses = Vec::new();
+    let mut total_messages_fetched = 0u64;
     
     for topic in request.topics {
         let topic_name = topic.topic.to_string();
@@ -693,13 +756,10 @@ async fn handle_fetch(
                    topic_name, partition.partition, partition.fetch_offset, 
                    partition.partition_max_bytes);
             
-            // Check if we need to use RecordBatch format
-            // Use RecordBatch for API v4+ OR when messages have headers
             let needs_record_batch = header.request_api_version >= 4 || 
                 storage.topic_has_headers(&topic_name, partition.partition);
             
             let (error_code, high_watermark, records_bytes) = if needs_record_batch {
-                // Use RecordBatch format for API v4+
                 let batch_result = storage.fetch_batch_recordbatch(
                     &topic_name,
                     partition.partition,
@@ -711,11 +771,16 @@ async fn handle_fetch(
                     Ok((hw, record_batch)) => {
                         debug!("RecordBatch fetch v{}: offset={}, hw={}, has_batch={}", 
                             header.request_api_version, partition.fetch_offset, hw, record_batch.is_some());
+                        // Count messages fetched
+                        if record_batch.is_some() && hw > partition.fetch_offset {
+                            let messages_in_batch = (hw - partition.fetch_offset) as u64;
+                            total_messages_fetched += messages_in_batch;
+                        }
                         (0, hw, Some(record_batch.unwrap_or_else(Bytes::new)))
                     },
                     Err(e) => {
                         debug!("Fetch error: {:?}", e);
-                        (3, 0, Some(Bytes::new())) // UnknownTopicOrPartition
+                        (3, 0, Some(Bytes::new()))
                     }
                 }
             } else {
@@ -731,12 +796,20 @@ async fn handle_fetch(
                     Ok((hw, message_set)) => {
                         debug!("Legacy fetch v{}: offset={}, hw={}, has_messageset={}", 
                             header.request_api_version, partition.fetch_offset, hw, message_set.is_some());
+                        // Count messages fetched
+                        if message_set.is_some() && hw > partition.fetch_offset {
+                            // Parse MessageSet to count actual messages
+                            if let Some(ref ms_bytes) = message_set {
+                                let messages = parse_message_set(ms_bytes);
+                                total_messages_fetched += messages.len() as u64;
+                            }
+                        }
                         // Always return Some(Bytes), never None
                         (0, hw, Some(message_set.unwrap_or_else(Bytes::new)))
                     },
                     Err(e) => {
                         debug!("Fetch error: {:?}", e);
-                        (3, 0, Some(Bytes::new())) // UnknownTopicOrPartition
+                        (3, 0, Some(Bytes::new()))
                     }
                 }
             };
@@ -766,6 +839,11 @@ async fn handle_fetch(
     response.error_code = 0;
     response.session_id = 0;
     response.responses = responses;
+
+    // Update fetch metrics
+    if total_messages_fetched > 0 {
+        metrics.increment_messages_fetched(total_messages_fetched).await;
+    }
 
     let mut response_header = ResponseHeader::default();
     response_header.correlation_id = header.correlation_id;
@@ -971,13 +1049,14 @@ async fn handle_offset_commit(
     buf: &mut BytesMut,
     group_manager: Arc<Mutex<ConsumerGroupManager>>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    debug!("Handling OffsetCommit request");
+    debug!("Handling OffsetCommit request version {}", header.request_api_version);
     
     let request = OffsetCommitRequest::decode(buf, header.request_api_version)?;
     let mut manager = group_manager.lock().await;
     
     let group_id = request.group_id.to_string();
     let generation_id = request.generation_id_or_member_epoch;
+    debug!("OffsetCommit for group_id: {}, generation_id: {}", group_id, generation_id);
     
     let mut offsets = Vec::new();
     for topic in &request.topics {
@@ -987,14 +1066,21 @@ async fn handle_offset_commit(
         }
     }
     
+    debug!("Committing offsets: {:?}", offsets);
     let result = manager.commit_offsets(&group_id, generation_id, offsets).await;
     
     let mut response = OffsetCommitResponse::default();
     response.throttle_time_ms = 0;
     
     let error_code = match result {
-        Ok(()) => 0,
-        Err(e) => error_code_from_group_error(&e),
+        Ok(()) => {
+            debug!("OffsetCommit successful");
+            0
+        },
+        Err(e) => {
+            debug!("OffsetCommit failed: {:?}", e);
+            error_code_from_group_error(&e)
+        },
     };
     
     response.topics = request.topics.into_iter().map(|topic| {
@@ -1024,12 +1110,13 @@ async fn handle_offset_fetch(
     buf: &mut BytesMut,
     group_manager: Arc<Mutex<ConsumerGroupManager>>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    debug!("Handling OffsetFetch request");
+    debug!("Handling OffsetFetch request version {}", header.request_api_version);
     
     let request = OffsetFetchRequest::decode(buf, header.request_api_version)?;
     let manager = group_manager.lock().await;
     
     let group_id = request.group_id.to_string();
+    debug!("OffsetFetch for group_id: {}, topics: {:?}", group_id, request.topics);
     
     let topics: Vec<(String, Vec<i32>)> = if let Some(topics) = request.topics {
         topics.into_iter().map(|topic| {
@@ -1038,10 +1125,13 @@ async fn handle_offset_fetch(
             (topic_name, partitions)
         }).collect()
     } else {
-        Vec::new()
+        // If no topics specified, fetch all offsets for this group
+        debug!("No topics specified in OffsetFetch, fetching all offsets for group {}", group_id);
+        manager.get_all_offsets_for_group(&group_id)
     };
     
     let fetched_offsets = manager.fetch_offsets(&group_id, topics);
+    debug!("Fetched offsets: {:?}", fetched_offsets);
     
     let mut response = OffsetFetchResponse::default();
     response.throttle_time_ms = 0;
@@ -1149,18 +1239,18 @@ async fn handle_list_offsets(
             for _ in 0..partitions_len {
                 let partition_index = buf.get_i32();
                 let timestamp = buf.get_i64();
-                let _max_offsets = buf.get_i32(); // ignored in v0
+                let _max_offsets = buf.get_i32();
                 
                 let mut partition_response = ListOffsetsPartitionResponse::default();
                 partition_response.partition_index = partition_index;
                 
                 let offset = if timestamp == -2 {
-                    0 // Earliest
+                    0
                 } else {
                     match storage.get_high_watermark(&topic_name, partition_index) {
                         Ok(hw) => hw,
                         Err(_) => {
-                            partition_response.error_code = 3; // UnknownTopicOrPartition
+                            partition_response.error_code = 3;
                             0
                         }
                     }

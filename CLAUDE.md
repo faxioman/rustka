@@ -7,9 +7,10 @@ Rustka is a minimal Kafka broker implementation in Rust that provides compatibil
 
 ### Core Components
 - **broker.rs**: Main TCP server handling Kafka protocol requests
-- **storage.rs**: In-memory storage with optional commit log persistence
-- **consumer_group.rs**: Consumer group coordination (JoinGroup/SyncGroup/Heartbeat)
-- **protocol**: Kafka wire protocol implementation using kafka-protocol crate
+- **storage.rs**: In-memory storage with retention and cleanup
+- **consumer_group.rs**: Consumer group coordination with offset management
+- **dashboard.rs**: Web dashboard for monitoring and management (port 8080)
+- **metrics.rs**: Metrics collection and reporting system
 
 ### Key Features
 - Kafka wire protocol compatibility (supports kafka-python)
@@ -98,3 +99,14 @@ RUST_LOG=debug ./target/release/rustka
 # - "Unknown member": Consumer group state issue, check rebalancing
 # - Encoding errors: Check RecordBatch format and API versions
 ```
+
+## Code Guidelines
+- **DO NOT add unnecessary comments** - Code should be self-documenting
+- Only add comments for complex algorithms or non-obvious business logic
+- Avoid obvious comments like "// Increment counter" or "// Return result"
+- Prefer clear variable/function names over explanatory comments
+- Keep comments concise and meaningful when truly needed
+- **Test Guidelines**:
+  - Python tests: ONLY for Kafka client integration testing
+  - Rust tests: For all other testing (unit tests, internal logic, non-Kafka features)
+  - Dashboard tests, retention tests, etc. should be in Rust, not Python

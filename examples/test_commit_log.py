@@ -6,14 +6,12 @@ from kafka import KafkaProducer, KafkaConsumer
 import time
 import json
 
-def test_commit_log_fix():
-    print("Testing commit log fix...")
+def test_commit_log():
+    print("Testing commit log functionality...")
     
-    # Create a unique group ID
-    group_id = f'test-commit-fix-{int(time.time())}'
+    group_id = f'test-commit-log-{int(time.time())}'
     topic = 'test-topic'
     
-    # Create consumer
     consumer = KafkaConsumer(
         topic,
         bootstrap_servers=['localhost:9092'],
@@ -23,10 +21,8 @@ def test_commit_log_fix():
         consumer_timeout_ms=1000
     )
     
-    # Force assignment
     consumer.poll(timeout_ms=100)
     
-    # First produce a message to have something to commit
     producer = KafkaProducer(
         bootstrap_servers=['localhost:9092'],
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
@@ -40,11 +36,9 @@ def test_commit_log_fix():
         print(f"✓ Consumed message at offset {msg.offset}")
         break
     
-    # Commit the offset
     consumer.commit()
     print(f"✓ Committed offsets for group {group_id}")
     
-    # Now read from __commit_log to verify the message has a key
     commit_log_consumer = KafkaConsumer(
         '__commit_log',
         bootstrap_servers=['localhost:9092'],
@@ -54,12 +48,9 @@ def test_commit_log_fix():
     
     found_our_commit = False
     for message in commit_log_consumer:
-        # Check if this message has a key
         if message.key is not None:
             print(f"✓ Found message with key: {len(message.key)} bytes")
-            # Try to parse the key to verify it's correct
             if len(message.key) >= 8:
-                # Check if it contains our group_id
                 key_str = message.key.hex()
                 if group_id.encode().hex() in key_str:
                     print(f"✓ Found our commit message with proper key!")
@@ -82,5 +73,5 @@ if __name__ == "__main__":
     # Wait a bit for Rustka to start
     time.sleep(1)
     
-    success = test_commit_log_fix()
+    success = test_commit_log()
     exit(0 if success else 1)

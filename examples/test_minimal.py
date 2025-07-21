@@ -5,7 +5,6 @@ Minimal test for debugging
 from kafka import KafkaProducer
 import logging
 
-# Enable debug logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'

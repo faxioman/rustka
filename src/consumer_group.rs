@@ -5,6 +5,8 @@ use kafka_protocol::messages::consumer_protocol_assignment::ConsumerProtocolAssi
 use kafka_protocol::protocol::Encodable;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use crate::metrics::MetricsCollector;
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
@@ -40,9 +42,13 @@ pub struct GroupMember {
 pub struct ConsumerGroupManager {
     groups: HashMap<String, ConsumerGroup>,
     member_to_group: HashMap<String, String>,
-    offsets: HashMap<(String, String, i32), i64>,
+    offsets: HashMap<(String, String, i32), (i64, Instant)>, // offset, last_commit_time
     next_member_id: i32,
     storage: Option<Arc<Mutex<crate::storage::InMemoryStorage>>>,
+    metrics: Option<Arc<MetricsCollector>>,
+    // Configuration
+    offset_retention_ms: u64,  // Default: 3600000 (1 hour)
+    empty_group_retention_ms: u64,  // Default: 600000 (10 minutes)
 }
 
 impl ConsumerGroupManager {
@@ -53,6 +59,9 @@ impl ConsumerGroupManager {
             offsets: HashMap::new(),
             next_member_id: 1,
             storage: None,
+            metrics: None,
+            offset_retention_ms: 3600000,  // 1 hour
+            empty_group_retention_ms: 600000,  // 10 minutes
         }
     }
     
@@ -60,6 +69,41 @@ impl ConsumerGroupManager {
         let mut mgr = Self::new();
         mgr.storage = Some(storage);
         mgr
+    }
+    
+    pub fn set_metrics(&mut self, metrics: Arc<MetricsCollector>) {
+        self.metrics = Some(metrics);
+    }
+    
+    /// Set retention times for testing
+    pub fn set_retention_times(&mut self, offset_retention_ms: u64, empty_group_retention_ms: u64) {
+        self.offset_retention_ms = offset_retention_ms;
+        self.empty_group_retention_ms = empty_group_retention_ms;
+    }
+    
+    /// Force cleanup of all empty groups and their offsets (for testing/admin)
+    pub fn force_cleanup_empty_groups(&mut self) {
+        let groups_to_remove: Vec<String> = self.groups.iter()
+            .filter_map(|(group_id, group)| {
+                if group.members.is_empty() {
+                    Some(group_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Remove all empty groups
+        for group_id in &groups_to_remove {
+            self.groups.remove(group_id);
+        }
+        
+        // Remove offsets for removed groups
+        self.offsets.retain(|(g, _, _), _| {
+            !groups_to_remove.contains(g)
+        });
+        
+        debug!("Force cleanup: removed {} empty groups and their offsets", groups_to_remove.len());
     }
 
     pub fn generate_member_id(&mut self, client_id: &str) -> String {
@@ -120,6 +164,25 @@ impl ConsumerGroupManager {
                 group.leader_id = member_id.clone();
                 group.generation_id = 1;
                 group.state = GroupState::AwaitingSync;
+                
+                // Update metrics for new consumer group
+                if let Some(metrics) = &self.metrics {
+                    let runtime = tokio::runtime::Handle::try_current();
+                    if let Ok(handle) = runtime {
+                        let metrics = metrics.clone();
+                        let group_id_clone = group_id.clone();
+                        let leader_id_clone = member_id.clone();
+                        handle.spawn(async move {
+                            metrics.update_consumer_group_metrics(
+                                group_id_clone, 
+                                "AwaitingSync".to_string(),
+                                1,  // generation_id
+                                1,  // members_count
+                                leader_id_clone
+                            ).await;
+                        });
+                    }
+                }
                 
                 // Leader gets the member list (just itself for now)
                 Ok(JoinGroupResult {
@@ -297,6 +360,27 @@ impl ConsumerGroupManager {
             }
             
             group.state = GroupState::Stable;
+            
+            // Update metrics when group becomes stable
+            if let Some(metrics) = &self.metrics {
+                let runtime = tokio::runtime::Handle::try_current();
+                if let Ok(handle) = runtime {
+                    let metrics = metrics.clone();
+                    let group_id_clone = group_id.to_string();
+                    let member_count = group.members.len();
+                    let generation_id = group.generation_id;
+                    let leader_id = group.leader_id.clone();
+                    handle.spawn(async move {
+                        metrics.update_consumer_group_metrics(
+                            group_id_clone, 
+                            "Stable".to_string(),
+                            generation_id,
+                            member_count,
+                            leader_id
+                        ).await;
+                    });
+                }
+            }
         }
 
         let member = group.members.get(member_id).unwrap();
@@ -351,7 +435,24 @@ impl ConsumerGroupManager {
         };
 
         if should_remove {
+            // Remove the group but keep offsets for a while
+            // They will be cleaned up by cleanup_orphaned_offsets() after retention expires
+            debug!("Group {} is now empty, removing group (keeping offsets temporarily)", group_id);
             self.groups.remove(group_id);
+            
+            // Update metrics to reflect group removal
+            if let Some(metrics) = &self.metrics {
+                let runtime = tokio::runtime::Handle::try_current();
+                if let Ok(handle) = runtime {
+                    let metrics = metrics.clone();
+                    let group_id_clone = group_id.to_string();
+                    handle.spawn(async move {
+                        // Remove group from metrics
+                        let mut groups = metrics.consumer_group_metrics.write().await;
+                        groups.remove(&group_id_clone);
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -363,12 +464,28 @@ impl ConsumerGroupManager {
         _generation_id: i32,
         offsets: Vec<(String, i32, i64)>,
     ) -> Result<(), GroupError> {
+        debug!("Committing offsets for group {}: {:?}", group_id, offsets);
+        
         if !self.groups.contains_key(group_id) {
-            return Err(GroupError::UnknownGroup);
+            debug!("Creating group {} for offset commit", group_id);
+            // Create group if it doesn't exist - this is needed for simple consumers
+            self.groups.insert(group_id.to_string(), ConsumerGroup {
+                _group_id: group_id.to_string(),
+                state: GroupState::Stable,
+                generation_id: 0,
+                protocol_type: "consumer".to_string(),
+                leader_id: "".to_string(),
+                members: HashMap::new(),
+                rebalance_start: None,
+            });
         }
 
         for (topic, partition, offset) in offsets {
-            self.offsets.insert((group_id.to_string(), topic.clone(), partition), offset);
+            debug!("Storing offset for {}/{}/{}: {}", group_id, topic, partition, offset);
+            self.offsets.insert(
+                (group_id.to_string(), topic.clone(), partition), 
+                (offset, Instant::now())
+            );
             
             // Write to __commit_log for Snuba compatibility
             if let Some(storage) = &self.storage {
@@ -388,16 +505,41 @@ impl ConsumerGroupManager {
         group_id: &str,
         topics: Vec<(String, Vec<i32>)>,
     ) -> Vec<(String, Vec<(i32, i64)>)> {
+        debug!("Fetching offsets for group {} topics {:?}", group_id, topics);
+        
         topics.into_iter().map(|(topic, partitions)| {
             let partition_offsets = partitions.into_iter().map(|partition| {
+                let key = (group_id.to_string(), topic.clone(), partition);
                 let offset = self.offsets
-                    .get(&(group_id.to_string(), topic.clone(), partition))
-                    .copied()
+                    .get(&key)
+                    .map(|(offset, _)| *offset)
                     .unwrap_or(-1);
+                debug!("Lookup {}/{}/{}: found {}", group_id, topic, partition, offset);
                 (partition, offset)
             }).collect();
             (topic, partition_offsets)
         }).collect()
+    }
+    
+    pub fn get_all_offsets_for_group(&self, group_id: &str) -> Vec<(String, Vec<i32>)> {
+        let mut topic_partitions: HashMap<String, Vec<i32>> = HashMap::new();
+        
+        for ((g_id, topic, partition), (_offset, _)) in &self.offsets {
+            if g_id == group_id {
+                topic_partitions
+                    .entry(topic.clone())
+                    .or_insert_with(Vec::new)
+                    .push(*partition);
+            }
+        }
+        
+        topic_partitions.into_iter()
+            .map(|(topic, mut partitions)| {
+                partitions.sort();
+                partitions.dedup();
+                (topic, partitions)
+            })
+            .collect()
     }
 
     pub fn check_expired_members(&mut self) {
@@ -417,6 +559,86 @@ impl ConsumerGroupManager {
 
         for (group_id, member_id) in expired_members {
             let _ = self.leave_group(&group_id, &member_id);
+        }
+        
+        // NOTE: We intentionally do NOT remove empty groups automatically
+        // because:
+        // 1. Clients expect groups to persist even when empty
+        // 2. We want to preserve committed offsets
+        // 3. Groups may be temporarily empty during rebalancing
+    }
+    
+    /// Get the number of stored offsets (for monitoring)
+    pub fn get_offset_count(&self) -> usize {
+        self.offsets.len()
+    }
+    
+    /// Get all consumer group IDs (for metrics cleanup)
+    pub fn get_all_group_ids(&self) -> Vec<String> {
+        self.groups.keys().cloned().collect()
+    }
+    
+    /// Clean up offsets for groups that no longer exist or old offsets
+    /// This prevents unbounded memory growth from offset accumulation
+    pub fn cleanup_orphaned_offsets(&mut self) {
+        let initial_count = self.offsets.len();
+        let initial_groups = self.groups.len();
+        let now = Instant::now();
+        
+        // Use configured retention times
+        let offset_retention_with_group = Duration::from_millis(self.offset_retention_ms);
+        let offset_retention_no_group = Duration::from_millis(self.offset_retention_ms / 12); // 1/12th for orphaned
+        let empty_group_retention = Duration::from_millis(self.empty_group_retention_ms);
+        
+        // First, clean up empty groups that are old enough
+        let groups_to_remove: Vec<String> = self.groups.iter()
+            .filter_map(|(group_id, group)| {
+                // Remove groups that:
+                // 1. Have no members
+                // 2. Have been empty for a while (check state)
+                if group.members.is_empty() && group.state != GroupState::PreparingRebalance {
+                    // Check if this group has recent offset activity
+                    let has_recent_offsets = self.offsets.iter().any(|((g, _, _), (_, last_commit))| {
+                        g == group_id && now.duration_since(*last_commit) < empty_group_retention
+                    });
+                    
+                    if !has_recent_offsets {
+                        Some(group_id.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Remove empty groups
+        for group_id in groups_to_remove {
+            self.groups.remove(&group_id);
+            debug!("Removed empty group: {}", group_id);
+        }
+        
+        // Now clean up offsets
+        let existing_groups: std::collections::HashSet<_> = self.groups.keys().cloned().collect();
+        
+        self.offsets.retain(|(group_id, _, _), (_, last_commit)| {
+            let age = now.duration_since(*last_commit);
+            
+            if existing_groups.contains(group_id) {
+                // Group exists - use longer retention
+                age < offset_retention_with_group
+            } else {
+                // Group doesn't exist - use shorter retention
+                age < offset_retention_no_group
+            }
+        });
+        
+        let removed_offsets = initial_count - self.offsets.len();
+        let removed_groups = initial_groups - self.groups.len();
+        
+        if removed_offsets > 0 || removed_groups > 0 {
+            debug!("Cleanup: removed {} offsets and {} empty groups", removed_offsets, removed_groups);
         }
     }
 }

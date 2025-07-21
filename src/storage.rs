@@ -6,8 +6,9 @@ use kafka_protocol::records::{
 };
 use indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
+use std::time::Instant;
+use std::collections::VecDeque;
 
-// Simple CRC32 implementation for Kafka message format
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xffffffff;
     for byte in data {
@@ -46,11 +47,14 @@ struct Record {
     key: Option<Bytes>,
     value: Bytes,
     headers: IndexMap<StrBytes, Option<Bytes>>,
+    timestamp: Instant,
+    offset: i64,
 }
 
 struct Partition {
-    records: Vec<Record>,
+    records: VecDeque<Record>,
     next_offset: i64,
+    base_offset: i64,  // First offset in the deque
 }
 
 impl InMemoryStorage {
@@ -79,8 +83,9 @@ impl InMemoryStorage {
             // Auto-create 3 partitions by default
             for i in 0..3 {
                 partitions.insert(i, Partition {
-                    records: Vec::new(),
+                    records: VecDeque::new(),
                     next_offset: 0,
+                    base_offset: 0,
                 });
             }
             Topic { partitions }
@@ -88,15 +93,44 @@ impl InMemoryStorage {
         
         let partition_entry = topic_entry.partitions.entry(partition).or_insert_with(|| {
             Partition {
-                records: Vec::new(),
+                records: VecDeque::new(),
                 next_offset: 0,
+                base_offset: 0,
             }
         });
         
         let offset = partition_entry.next_offset;
         
-        partition_entry.records.push(Record { key, value, headers });
+        partition_entry.records.push_back(Record { 
+            key, 
+            value, 
+            headers,
+            timestamp: Instant::now(),
+            offset,
+        });
         partition_entry.next_offset += 1;
+        
+        // Retention policy: size and time based
+        const MAX_MESSAGES_PER_PARTITION: usize = 1000;
+        const MAX_MESSAGE_AGE: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+        
+        // Remove old messages based on time
+        let now = Instant::now();
+        while let Some(front) = partition_entry.records.front() {
+            if now.duration_since(front.timestamp) > MAX_MESSAGE_AGE {
+                if let Some(removed) = partition_entry.records.pop_front() {
+                    partition_entry.base_offset = removed.offset + 1;
+                }
+            } else {
+                break; // Messages are ordered, so we can stop here
+            }
+        }
+        
+        if partition_entry.records.len() > MAX_MESSAGES_PER_PARTITION {
+            if let Some(removed) = partition_entry.records.pop_front() {
+                partition_entry.base_offset = removed.offset + 1;
+            }
+        }
         
         offset
     }
@@ -130,7 +164,13 @@ impl InMemoryStorage {
         let mut record_count = 0;
         
         while current_offset < high_watermark && total_size < max_bytes {
-            let record_index = current_offset as usize;
+            // Skip if offset is before our base_offset (already deleted)
+            if current_offset < partition_data.base_offset {
+                current_offset += 1;
+                continue;
+            }
+            
+            let record_index = (current_offset - partition_data.base_offset) as usize;
             if record_index >= partition_data.records.len() {
                 break;
             }
@@ -238,7 +278,13 @@ impl InMemoryStorage {
         let mut estimated_size = 0;
         
         while current_offset < high_watermark && estimated_size < max_bytes as usize {
-            let record_index = current_offset as usize;
+            // Skip if offset is before our base_offset (already deleted)
+            if current_offset < partition_data.base_offset {
+                current_offset += 1;
+                continue;
+            }
+            
+            let record_index = (current_offset - partition_data.base_offset) as usize;
             if record_index >= partition_data.records.len() {
                 break;
             }
@@ -318,5 +364,121 @@ impl InMemoryStorage {
             .ok_or_else(|| StorageError::PartitionNotFound(topic.to_string(), partition))?;
         
         Ok(partition_data.next_offset)
+    }
+    
+    pub fn cleanup_old_messages(&mut self) {
+        const MAX_MESSAGE_AGE: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+        let now = Instant::now();
+        
+        for topic in self.topics.values_mut() {
+            for partition in topic.partitions.values_mut() {
+                // Remove messages older than MAX_MESSAGE_AGE
+                while let Some(front) = partition.records.front() {
+                    if now.duration_since(front.timestamp) > MAX_MESSAGE_AGE {
+                        if let Some(removed) = partition.records.pop_front() {
+                            partition.base_offset = removed.offset + 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                // More aggressive VecDeque capacity management to prevent memory bloat
+                let len = partition.records.len();
+                let cap = partition.records.capacity();
+                
+                // Shrink if using less than 25% of capacity and capacity is significant
+                if cap > 32 && len < cap / 4 {
+                    // Shrink to 2x current size to leave some headroom
+                    let new_cap = (len * 2).max(16);
+                    partition.records.shrink_to(new_cap);
+                } else if partition.records.is_empty() && cap > 16 {
+                    // If completely empty, shrink to minimal size
+                    partition.records.shrink_to_fit();
+                }
+            }
+        }
+    }
+    
+    pub fn clear_all_messages(&mut self) {
+        for topic in self.topics.values_mut() {
+            for partition in topic.partitions.values_mut() {
+                // Clear all messages but keep the offset history
+                partition.records.clear();
+                partition.records.shrink_to_fit();
+                partition.base_offset = partition.next_offset;
+            }
+        }
+    }
+    
+    pub fn cleanup_empty_topics(&mut self) -> usize {
+        let mut empty_topics = Vec::new();
+        
+        for (topic_name, topic) in self.topics.iter() {
+            let mut all_empty = true;
+            
+            for partition in topic.partitions.values() {
+                // A partition is empty if it has no records
+                // We don't check next_offset because it keeps the history
+                if !partition.records.is_empty() {
+                    all_empty = false;
+                    break;
+                }
+            }
+            
+            if all_empty {
+                empty_topics.push(topic_name.clone());
+            }
+        }
+        
+        let count = empty_topics.len();
+        
+        // Remove empty topics
+        for topic_name in empty_topics {
+            self.topics.remove(&topic_name);
+        }
+        
+        count
+    }
+    
+    pub fn get_storage_stats(&self) -> StorageStats {
+        let mut total_messages = 0;
+        let total_topics = self.topics.len();
+        let mut total_partitions = 0;
+        let mut oldest_message_age = None;
+        
+        for topic in self.topics.values() {
+            for partition in topic.partitions.values() {
+                total_partitions += 1;
+                total_messages += partition.records.len();
+                
+                // Check oldest message age
+                if let Some(first_record) = partition.records.front() {
+                    let age = first_record.timestamp.elapsed();
+                    oldest_message_age = Some(oldest_message_age.map_or(age, |old: std::time::Duration| old.max(age)));
+                }
+            }
+        }
+        
+        StorageStats {
+            total_messages,
+            total_topics,
+            total_partitions,
+            oldest_message_age,
+        }
+    }
+}
+
+pub struct StorageStats {
+    pub total_messages: usize,
+    pub total_topics: usize,
+    pub total_partitions: usize,
+    pub oldest_message_age: Option<std::time::Duration>,
+}
+
+#[allow(dead_code)]
+impl StorageStats {
+    pub fn total_topics(&self) -> usize {
+        self.total_topics
     }
 }

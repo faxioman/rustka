@@ -9,39 +9,31 @@ import os
 import time
 from pathlib import Path
 
-# Define test order - from basic to complex
 TEST_ORDER = [
-    # Basic connectivity and produce tests
     ("test_minimal.py", "Minimal connection test"),
     ("test_client.py", "Basic client test"),
     
-    # API version and negotiation tests
     ("test_api_version.py", "API version compatibility"),
     ("test_api_negotiation.py", "API version negotiation test"),
     ("test_simple_negotiation.py", "Simple negotiation test"),
     
-    # Fetch and throughput tests
     ("test_minimal_fetch.py", "Minimal fetch test"),
     ("test_modern_api.py", "Modern API throughput test"),
     
-    # Record batch and advanced features
     ("test_recordbatch.py", "Record batch format test"),
     ("test_headers.py", "Kafka message headers support"),
     
-    # Consumer group tests
     ("test_consumer_group.py", "Consumer group test"),
+    ("test_producer_consumer_threads.py", "Producer/consumer threading test"),
     
-    # Compatibility test suites
     ("test_simple_compatibility.py", "Simple compatibility suite"),
     ("test_kafka_compatibility.py", "Full Kafka compatibility suite"),
     ("test_sentry_like.py", "Sentry-like usage patterns"),
     ("test_sentry_compatibility.py", "Sentry compatibility suite"),
     
-    # Commit log tests
-    ("test_commit_log_fix.py", "Commit log key fix verification"),
+    ("test_commit_log.py", "Commit log key verification"),
     ("test_snuba_compatibility.py", "Snuba commit log compatibility"),
     
-    # Authentication tests
     ("test_authentication.py", "SASL PLAIN authentication test"),
 ]
 
@@ -97,11 +89,8 @@ def main():
     print(f"Running {len(TEST_ORDER)} tests...")
     print(f"Python: {sys.executable}")
     
-    # Check if broker is running
     print("\n⚠️  Make sure the Rustka broker is running on localhost:9092")
-    print("   Run 'cargo run --release' in another terminal")
-    print("\n💡 For Sentry testing, run 'python init_sentry_topics.py' first")
-    input("\nPress Enter to continue...")
+    print("   Run 'cargo run --release' in another terminal\n")
     
     passed = 0
     failed = 0

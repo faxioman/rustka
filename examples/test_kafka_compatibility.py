@@ -167,15 +167,21 @@ class TestKafkaCompatibility(unittest.TestCase):
         
         # Consume a message
         last_offset = None
+        last_partition = None
         for message in consumer1:
             last_offset = message.offset
+            last_partition = message.partition
             consumer1.commit()
-            print(f"Consumer1 committed offset: {last_offset}")
+            print(f"Consumer1 consumed from partition {last_partition}, committed offset: {last_offset}")
             break
         
         consumer1.close()
         
         if last_offset is not None:
+            # Small delay to ensure commit is processed
+            import time
+            time.sleep(0.5)
+            
             # Consumer 2: should start from committed offset
             consumer2 = KafkaConsumer(
                 topic,
@@ -185,19 +191,34 @@ class TestKafkaCompatibility(unittest.TestCase):
                 api_version=(0, 10, 0)
             )
             
-            # Poll to get assignment
-            consumer2.poll(timeout_ms=1000)
+            # Poll multiple times to ensure proper group join
+            print(f"Consumer2 joining group {group_id}...")
+            for i in range(3):
+                consumer2.poll(timeout_ms=1000)
+                time.sleep(0.1)
             
             # Verify the committed offset
             partitions = consumer2.assignment()
+            print(f"Consumer2 assignment: {partitions}")
+            
             if partitions:
-                partition = list(partitions)[0]
-                committed = consumer2.committed(partition)
-                print(f"Consumer2 sees committed offset: {committed}")
+                # Check the specific partition that consumer1 used
+                from kafka import TopicPartition
+                tp = TopicPartition(topic, last_partition)
+                committed = consumer2.committed(tp)
+                print(f"Consumer2 sees committed offset for partition {last_partition}: {committed}")
+                
+                # Also check all partitions
+                for p in partitions:
+                    c = consumer2.committed(p)
+                    print(f"  Partition {p.partition}: {c}")
+                
                 self.assertIsNotNone(committed)
-                # Kafka stores next offset to read, but some implementations may store last read offset
-                self.assertIn(committed, [last_offset, last_offset + 1], 
-                             f"Expected committed offset to be {last_offset} or {last_offset + 1}, got {committed}")
+                # Kafka stores next offset to read, so should be last_offset + 1
+                self.assertEqual(committed, last_offset + 1, 
+                             f"Expected committed offset to be {last_offset + 1}, got {committed}")
+            else:
+                self.fail("Consumer2 has no assignment")
             
             consumer2.close()
     

@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rustka Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background-color: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 20px 0;
+            margin-bottom: 30px;
+        }
+        
+        header h1 {
+            text-align: center;
+            font-size: 2.5em;
+            color: #58a6ff;
+            font-weight: 600;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-card {
+            background: #161b22;
+            padding: 20px;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+            transition: all 0.2s;
+        }
+        
+        .metric-card:hover {
+            border-color: #58a6ff;
+            box-shadow: 0 0 0 1px #58a6ff;
+        }
+        
+        .metric-card h3 {
+            color: #8b949e;
+            margin-bottom: 10px;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 500;
+        }
+        
+        .metric-value {
+            font-size: 2.5em;
+            font-weight: 600;
+            color: #58a6ff;
+        }
+        
+        .section {
+            background: #161b22;
+            padding: 30px;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+            margin-bottom: 30px;
+        }
+        
+        .section h2 {
+            color: #58a6ff;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+            font-weight: 600;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #30363d;
+        }
+        
+        th {
+            background-color: #0d1117;
+            font-weight: 600;
+            color: #58a6ff;
+            text-transform: uppercase;
+            font-size: 0.85em;
+            letter-spacing: 0.5px;
+        }
+        
+        tr:hover {
+            background-color: #1c2128;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+        
+        .status-stable {
+            background-color: #238636;
+            color: #ffffff;
+        }
+        
+        .status-rebalancing {
+            background-color: #9e6a03;
+            color: #ffffff;
+        }
+        
+        .status-empty {
+            background-color: #da3633;
+            color: #ffffff;
+        }
+        
+        .refresh-info {
+            text-align: center;
+            color: #8b949e;
+            margin-top: 20px;
+            font-size: 0.9em;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 50px;
+            color: #8b949e;
+        }
+        
+        .error {
+            background-color: #da3633;
+            color: #ffffff;
+            padding: 20px;
+            border-radius: 6px;
+            margin: 20px 0;
+        }
+        
+        .partition-list {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+        
+        .partition-badge {
+            background-color: #0d1117;
+            border: 1px solid #30363d;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 0.85em;
+            color: #8b949e;
+        }
+        
+        .cleanup-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+        }
+        
+        .cleanup-button {
+            margin: 10px;
+            padding: 10px 20px;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.2s;
+            font-weight: 500;
+        }
+        
+        .cleanup-button.danger {
+            background-color: #da3633;
+            color: white;
+            border-color: #da3633;
+        }
+        
+        .cleanup-button.warning {
+            background-color: #9e6a03;
+            color: white;
+            border-color: #9e6a03;
+        }
+        
+        .cleanup-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        
+        .cleanup-button.danger:hover {
+            background-color: #f85149;
+            border-color: #f85149;
+        }
+        
+        .cleanup-button.warning:hover {
+            background-color: #dbab09;
+            border-color: #dbab09;
+        }
+        
+        .cleanup-result {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 6px;
+            display: none;
+        }
+        
+        .cleanup-result.success {
+            background-color: #238636;
+            color: #ffffff;
+            border: 1px solid #2ea043;
+        }
+        
+        .cleanup-result.error {
+            background-color: #da3633;
+            color: #ffffff;
+            border: 1px solid #f85149;
+        }
+        
+        strong {
+            color: #f0f6fc;
+        }
+        
+        td {
+            color: #c9d1d9;
+        }
+        
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #0d1117;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 5px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #484f58;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>🚀 Rustka Dashboard</h1>
+        </div>
+    </header>
+    
+    <div class="container">
+        <div id="content">
+            <div class="loading">Loading metrics...</div>
+        </div>
+        
+        <div class="refresh-info">
+            Auto-refreshing every 2 seconds
+        </div>
+    </div>
+    
+    <script>
+        let refreshInterval;
+        
+        function formatUptime(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = seconds % 60;
+            
+            if (hours > 0) {
+                return `${hours}h ${minutes}m ${secs}s`;
+            } else if (minutes > 0) {
+                return `${minutes}m ${secs}s`;
+            } else {
+                return `${secs}s`;
+            }
+        }
+        
+        function formatNumber(num) {
+            return num.toLocaleString();
+        }
+        
+        function formatDuration(seconds) {
+            if (seconds < 60) return `${seconds}s`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+            if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+            return `${Math.floor(seconds / 86400)}d`;
+        }
+        
+        function getStatusBadgeClass(state) {
+            switch(state.toLowerCase()) {
+                case 'stable': return 'status-stable';
+                case 'preparingrebalance':
+                case 'awaitingsync': return 'status-rebalancing';
+                case 'empty': return 'status-empty';
+                default: return '';
+            }
+        }
+        
+        function renderMetrics(data) {
+            const content = document.getElementById('content');
+            
+            let html = `
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <h3>Uptime</h3>
+                        <div class="metric-value">${formatUptime(data.broker.uptime_seconds)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Active Connections</h3>
+                        <div class="metric-value">${formatNumber(data.broker.active_connections)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Total Requests</h3>
+                        <div class="metric-value">${formatNumber(data.broker.total_requests)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Messages Produced</h3>
+                        <div class="metric-value">${formatNumber(data.broker.total_messages_produced)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Messages Fetched</h3>
+                        <div class="metric-value">${formatNumber(data.broker.total_messages_fetched)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Topics</h3>
+                        <div class="metric-value">${data.broker.topics_count}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Consumer Groups</h3>
+                        <div class="metric-value">${data.broker.consumer_groups_count}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Total Connections</h3>
+                        <div class="metric-value">${formatNumber(data.broker.total_connections)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Messages in Memory</h3>
+                        <div class="metric-value">${formatNumber(data.broker.storage_total_messages || 0)}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Total Partitions</h3>
+                        <div class="metric-value">${data.broker.storage_total_partitions || 0}</div>
+                    </div>
+                    <div class="metric-card">
+                        <h3>Oldest Message Age</h3>
+                        <div class="metric-value">${data.broker.storage_oldest_message_seconds ? formatDuration(data.broker.storage_oldest_message_seconds) : 'N/A'}</div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2>📁 Topics</h2>
+                    ${Object.keys(data.topics).length > 0 ? `
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Topic Name</th>
+                                    <th>Partitions</th>
+                                    <th>Total Messages</th>
+                                    <th>Partition Details</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${Object.values(data.topics).map(topic => `
+                                    <tr>
+                                        <td><strong>${topic.name}</strong></td>
+                                        <td>${topic.partitions.length}</td>
+                                        <td>${formatNumber(topic.total_messages)}</td>
+                                        <td>
+                                            <div class="partition-list">
+                                                ${topic.partitions.map(p => `
+                                                    <span class="partition-badge">
+                                                        P${p.id}: ${formatNumber(p.message_count)} msgs
+                                                    </span>
+                                                `).join('')}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    ` : '<p>No topics created yet</p>'}
+                </div>
+                
+                <div class="section">
+                    <h2>👥 Consumer Groups</h2>
+                    ${Object.keys(data.consumer_groups).length > 0 ? `
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Group ID</th>
+                                    <th>State</th>
+                                    <th>Generation</th>
+                                    <th>Members</th>
+                                    <th>Leader ID</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${Object.values(data.consumer_groups).map(group => `
+                                    <tr>
+                                        <td><strong>${group.group_id}</strong></td>
+                                        <td>
+                                            <span class="status-badge ${getStatusBadgeClass(group.state)}">
+                                                ${group.state}
+                                            </span>
+                                        </td>
+                                        <td>${group.generation_id}</td>
+                                        <td>${group.members_count}</td>
+                                        <td>${group.leader_id || '-'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    ` : '<p>No consumer groups active</p>'}
+                </div>
+                
+                <div class="section cleanup-section">
+                    <h2>🧹 Cleanup Operations</h2>
+                    <p>Use these operations to free up memory:</p>
+                    <button class="cleanup-button warning" onclick="cleanupEmptyTopics()">
+                        Remove Empty Topics
+                    </button>
+                    <button class="cleanup-button danger" onclick="cleanupAllMessages()">
+                        Clear All Messages
+                    </button>
+                    <div id="cleanup-result" class="cleanup-result"></div>
+                </div>
+            `;
+            
+            content.innerHTML = html;
+        }
+        
+        async function fetchMetrics() {
+            try {
+                const response = await fetch('/api/metrics');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                renderMetrics(data);
+            } catch (error) {
+                console.error('Error fetching metrics:', error);
+                document.getElementById('content').innerHTML = `
+                    <div class="error">
+                        Failed to fetch metrics: ${error.message}
+                    </div>
+                `;
+            }
+        }
+        
+        // Initial load
+        fetchMetrics();
+        
+        // Refresh every 2 seconds
+        refreshInterval = setInterval(fetchMetrics, 2000);
+        
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        });
+        
+        async function cleanupEmptyTopics() {
+            try {
+                const response = await fetch('/api/cleanup/empty-topics', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const result = await response.json();
+                showCleanupResult(result);
+                
+                // Refresh metrics after cleanup
+                setTimeout(fetchMetrics, 500);
+            } catch (error) {
+                showCleanupResult({
+                    success: false,
+                    message: `Error: ${error.message}`
+                });
+            }
+        }
+        
+        async function cleanupAllMessages() {
+            if (!confirm('Are you sure you want to clear ALL messages? This cannot be undone!')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/cleanup/all-messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const result = await response.json();
+                showCleanupResult(result);
+                
+                // Refresh metrics after cleanup
+                setTimeout(fetchMetrics, 500);
+            } catch (error) {
+                showCleanupResult({
+                    success: false,
+                    message: `Error: ${error.message}`
+                });
+            }
+        }
+        
+        function showCleanupResult(result) {
+            const resultDiv = document.getElementById('cleanup-result');
+            if (resultDiv) {
+                resultDiv.className = `cleanup-result ${result.success ? 'success' : 'error'}`;
+                resultDiv.textContent = result.message;
+                resultDiv.style.display = 'block';
+                
+                // Hide after 5 seconds
+                setTimeout(() => {
+                    resultDiv.style.display = 'none';
+                }, 5000);
+            }
+        }
+    </script>
+</body>
+</html>
