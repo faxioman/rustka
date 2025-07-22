@@ -1,65 +1,69 @@
 #!/usr/bin/env python3
 """
-Minimal test to check record format
+Minimal test to check record format with librdkafka
 """
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.structs import TopicPartition
+from confluent_kafka import Producer, Consumer, TopicPartition
 import time
-import struct
 
 # Produce a simple message
-producer = KafkaProducer(
-    bootstrap_servers=['localhost:9092'],
-    api_version=(0, 10, 0)
-)
+producer = Producer({
+    'bootstrap.servers': '127.0.0.1:9092',
+})
 
 topic = f'minimal-test-{int(time.time())}'
-future = producer.send(topic, b'Hello World')
-metadata = future.get(timeout=10)
-print(f"Produced to {metadata.topic} partition {metadata.partition} offset {metadata.offset}")
-producer.close()
+partition = 0
+delivered_offset = None
+
+def delivery_report(err, msg):
+    global delivered_offset
+    if err is None:
+        delivered_offset = msg.offset()
+        print(f"Produced to {msg.topic()} partition {msg.partition()} offset {msg.offset()}")
+
+producer.produce(topic, b'Hello World', partition=partition, callback=delivery_report)
+producer.flush()
 
 # Create consumer
-consumer = KafkaConsumer(
-    bootstrap_servers=['localhost:9092'],
-    auto_offset_reset='earliest',
-    group_id=f'test-{int(time.time())}',
-    api_version=(0, 10, 0),
-    consumer_timeout_ms=2000,
-    enable_auto_commit=False
-)
+consumer = Consumer({
+    'bootstrap.servers': '127.0.0.1:9092',
+    'group.id': f'test-{int(time.time())}',
+    'auto.offset.reset': 'earliest',
+    'enable.auto.commit': False,
+})
 
 # Assign specific partition
-tp = TopicPartition(topic, 0)
+tp = TopicPartition(topic, partition, 0)  # Start from offset 0
 consumer.assign([tp])
 
 # Try to poll
 print("\nPolling for messages...")
 try:
-    messages = consumer.poll(timeout_ms=1000, max_records=1)
-    print(f"Poll returned {len(messages)} topic-partitions")
+    msg = consumer.poll(timeout=2.0)
     
-    for tp, records in messages.items():
-        print(f"\nTopicPartition: {tp}")
-        print(f"Number of records: {len(records)}")
+    if msg is None:
+        print("No messages received")
+    elif msg.error():
+        print(f"Consumer error: {msg.error()}")
+    else:
+        print(f"\nRecord details:")
+        print(f"  topic: {msg.topic()}")
+        print(f"  partition: {msg.partition()}")
+        print(f"  offset: {msg.offset()}")
+        print(f"  timestamp: {msg.timestamp()}")
+        print(f"  key: {msg.key()}")
+        print(f"  value: {msg.value()}")
+        print(f"  value type: {type(msg.value())}")
         
-        for record in records:
-            print(f"\nRecord details:")
-            print(f"  offset: {record.offset}")
-            print(f"  timestamp: {record.timestamp}")
-            print(f"  key: {record.key}")
-            print(f"  value: {record.value}")
-            print(f"  value type: {type(record.value)}")
-            
-            # Try to see raw bytes
-            if record.value:
-                print(f"  First 20 bytes: {record.value[:20]}")
-                # Try to decode as string
-                try:
-                    decoded = record.value.decode('utf-8')
-                    print(f"  Decoded: {decoded}")
-                except Exception as e:
-                    print(f"  Failed to decode: {e}")
+        # Show raw bytes
+        if msg.value():
+            print(f"  First 20 bytes: {msg.value()[:20]}")
+            # Try to decode as string
+            try:
+                decoded = msg.value().decode('utf-8')
+                print(f"  Decoded: {decoded}")
+            except Exception as e:
+                print(f"  Failed to decode: {e}")
+                
 except Exception as e:
     print(f"Error during poll: {e}")
     import traceback

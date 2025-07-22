@@ -2,9 +2,8 @@
 """
 Compatibility test: verifies that Rustka behaves like Kafka
 """
-from kafka import KafkaProducer, KafkaConsumer, KafkaAdminClient
-from kafka.admin import NewTopic
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer, KafkaError, TopicPartition
+from confluent_kafka.admin import AdminClient, NewTopic
 import json
 import time
 import unittest
@@ -16,58 +15,86 @@ class TestKafkaCompatibility(unittest.TestCase):
     
     @classmethod
     def setUpClass(cls):
-        cls.bootstrap_servers = ['localhost:9092']
+        cls.bootstrap_servers = '127.0.0.1:9092'
         # Use unique topic for each test run to avoid conflicts
         cls.test_run_id = str(uuid.uuid4())[:8]
         cls.test_topic = f'test-compatibility-{cls.test_run_id}'
         print(f"Using topic: {cls.test_topic}")
+        
+        # Create topics
+        admin = AdminClient({'bootstrap.servers': cls.bootstrap_servers})
+        topics_to_create = [
+            NewTopic(cls.test_topic, num_partitions=3, replication_factor=1),
+            NewTopic(f'{cls.test_topic}-rebalance', num_partitions=3, replication_factor=1),
+            NewTopic(f'{cls.test_topic}-offset', num_partitions=3, replication_factor=1),
+            NewTopic(f'{cls.test_topic}-partitions', num_partitions=3, replication_factor=1),
+        ]
+        fs = admin.create_topics(topics_to_create)
+        for topic, f in fs.items():
+            try:
+                f.result()
+            except Exception as e:
+                pass  # Topic might already exist
     
     def test_01_produce_consume_basic(self):
         """Basic test: produce and consume a message"""
         # Use a unique group for this test
         group_id = f'test-basic-{self.test_run_id}'
         
-        producer = KafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            api_version=(0, 10, 0)
-        )
+        producer = Producer({
+            'bootstrap.servers': self.bootstrap_servers,
+        })
         
-        test_message = {'test': 'basic', 'timestamp': time.time()}
-        future = producer.send(self.test_topic, test_message)
-        record = future.get(timeout=10)
-        producer.close()
+        test_message = json.dumps({'test': 'basic', 'timestamp': time.time()})
         
-        self.assertIsNotNone(record)
-        self.assertEqual(record.topic, self.test_topic)
-        self.assertGreaterEqual(record.offset, 0)
+        delivered = False
+        partition = None
+        offset = None
         
-        # Consume with safe deserializer
-        def safe_deserializer(m):
-            try:
-                return json.loads(m.decode('utf-8'))
-            except:
-                return {'raw': m.decode('utf-8', errors='replace')}
+        def delivery_report(err, msg):
+            nonlocal delivered, partition, offset
+            if err is None:
+                delivered = True
+                partition = msg.partition()
+                offset = msg.offset()
         
-        consumer = KafkaConsumer(
-            self.test_topic,
-            bootstrap_servers=self.bootstrap_servers,
-            group_id=group_id,
-            auto_offset_reset='earliest',
-            consumer_timeout_ms=5000,
-            value_deserializer=safe_deserializer,
-            api_version=(0, 10, 0)
-        )
+        producer.produce(self.test_topic, value=test_message.encode('utf-8'), callback=delivery_report)
+        producer.flush()
+        
+        self.assertTrue(delivered)
+        self.assertIsNotNone(partition)
+        self.assertGreaterEqual(offset, 0)
+        
+        # Consume
+        consumer = Consumer({
+            'bootstrap.servers': self.bootstrap_servers,
+            'group.id': group_id,
+            'auto.offset.reset': 'earliest',
+        })
+        
+        consumer.subscribe([self.test_topic])
         
         messages = []
-        for msg in consumer:
-            if isinstance(msg.value, dict) and msg.value.get('test') == 'basic':
-                messages.append(msg)
+        start_time = time.time()
+        while time.time() - start_time < 5:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+            else:
+                try:
+                    value = json.loads(msg.value().decode('utf-8'))
+                    if value.get('test') == 'basic':
+                        messages.append(msg)
+                        break
+                except:
+                    pass
         
         consumer.close()
         
         self.assertGreater(len(messages), 0)
-        self.assertEqual(messages[0].value['test'], 'basic')
     
     def test_02_consumer_group_rebalance(self):
         """Test consumer group rebalancing"""
@@ -77,39 +104,39 @@ class TestKafkaCompatibility(unittest.TestCase):
         stop_consumers = threading.Event()
         
         # First produce messages
-        producer = KafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            api_version=(0, 10, 0)
-        )
+        producer = Producer({
+            'bootstrap.servers': self.bootstrap_servers,
+        })
         
         print(f"Producing messages to {topic}")
         for i in range(10):
-            producer.send(topic, f'message-{i}'.encode('utf-8'))
+            producer.produce(topic, f'message-{i}'.encode('utf-8'))
         producer.flush()
-        producer.close()
         
         # Small delay to ensure messages are available
         time.sleep(1)
         
         def consumer_thread(consumer_id):
             try:
-                consumer = KafkaConsumer(
-                    topic,
-                    bootstrap_servers=self.bootstrap_servers,
-                    group_id=group_id,
-                    auto_offset_reset='earliest',
-                    api_version=(0, 10, 0),
-                    consumer_timeout_ms=1000
-                )
+                consumer = Consumer({
+                    'bootstrap.servers': self.bootstrap_servers,
+                    'group.id': group_id,
+                    'auto.offset.reset': 'earliest',
+                })
                 
+                consumer.subscribe([topic])
                 print(f"{consumer_id} started")
                 
                 while not stop_consumers.is_set():
-                    messages = consumer.poll(timeout_ms=500)
-                    for topic_partition, records in messages.items():
-                        for record in records:
-                            consumed_by[record.offset] = consumer_id
-                            print(f"{consumer_id} consumed offset {record.offset}")
+                    msg = consumer.poll(0.5)
+                    if msg is None:
+                        continue
+                    if msg.error():
+                        if msg.error().code() == KafkaError._PARTITION_EOF:
+                            continue
+                    else:
+                        consumed_by[msg.offset()] = consumer_id
+                        print(f"{consumer_id} consumed offset {msg.offset()}")
                 
                 consumer.close()
                 print(f"{consumer_id} stopped")
@@ -146,74 +173,72 @@ class TestKafkaCompatibility(unittest.TestCase):
         group_id = f'test-offset-{self.test_run_id}'
         
         # Produce a message
-        producer = KafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            api_version=(0, 10, 0)
-        )
-        producer.send(topic, b'offset-test-message')
+        producer = Producer({
+            'bootstrap.servers': self.bootstrap_servers,
+        })
+        producer.produce(topic, b'offset-test-message')
         producer.flush()
-        producer.close()
         
         # Consumer 1: consume and commit
-        consumer1 = KafkaConsumer(
-            topic,
-            bootstrap_servers=self.bootstrap_servers,
-            group_id=group_id,
-            enable_auto_commit=False,
-            auto_offset_reset='earliest',
-            api_version=(0, 10, 0),
-            consumer_timeout_ms=5000
-        )
+        consumer1 = Consumer({
+            'bootstrap.servers': self.bootstrap_servers,
+            'group.id': group_id,
+            'enable.auto.commit': False,
+            'auto.offset.reset': 'earliest',
+        })
+        
+        consumer1.subscribe([topic])
         
         # Consume a message
         last_offset = None
         last_partition = None
-        for message in consumer1:
-            last_offset = message.offset
-            last_partition = message.partition
-            consumer1.commit()
-            print(f"Consumer1 consumed from partition {last_partition}, committed offset: {last_offset}")
-            break
+        start_time = time.time()
+        while time.time() - start_time < 5:
+            msg = consumer1.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+            else:
+                last_offset = msg.offset()
+                last_partition = msg.partition()
+                consumer1.commit()
+                print(f"Consumer1 consumed from partition {last_partition}, committed offset: {last_offset}")
+                break
         
         consumer1.close()
         
         if last_offset is not None:
             # Small delay to ensure commit is processed
-            import time
             time.sleep(0.5)
             
             # Consumer 2: should start from committed offset
-            consumer2 = KafkaConsumer(
-                topic,
-                bootstrap_servers=self.bootstrap_servers,
-                group_id=group_id,
-                enable_auto_commit=False,
-                api_version=(0, 10, 0)
-            )
+            consumer2 = Consumer({
+                'bootstrap.servers': self.bootstrap_servers,
+                'group.id': group_id,
+                'enable.auto.commit': False,
+            })
+            
+            consumer2.subscribe([topic])
             
             # Poll multiple times to ensure proper group join
             print(f"Consumer2 joining group {group_id}...")
             for i in range(3):
-                consumer2.poll(timeout_ms=1000)
+                consumer2.poll(1.0)
                 time.sleep(0.1)
             
-            # Verify the committed offset
-            partitions = consumer2.assignment()
-            print(f"Consumer2 assignment: {partitions}")
+            # Get assignment
+            assignment = consumer2.assignment()
+            print(f"Consumer2 assignment: {assignment}")
             
-            if partitions:
+            if assignment:
                 # Check the specific partition that consumer1 used
-                from kafka import TopicPartition
                 tp = TopicPartition(topic, last_partition)
-                committed = consumer2.committed(tp)
+                committed = consumer2.committed([tp])[0].offset
                 print(f"Consumer2 sees committed offset for partition {last_partition}: {committed}")
                 
-                # Also check all partitions
-                for p in partitions:
-                    c = consumer2.committed(p)
-                    print(f"  Partition {p.partition}: {c}")
-                
-                self.assertIsNotNone(committed)
+                self.assertNotEqual(committed, -1001)  # -1001 means no committed offset
                 # Kafka stores next offset to read, so should be last_offset + 1
                 self.assertEqual(committed, last_offset + 1, 
                              f"Expected committed offset to be {last_offset + 1}, got {committed}")
@@ -226,48 +251,52 @@ class TestKafkaCompatibility(unittest.TestCase):
         """Test with multiple partitions"""
         topic = f'{self.test_topic}-partitions'
         
-        producer = KafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            key_serializer=lambda k: k.encode('utf-8'),
-            api_version=(0, 10, 0)
-        )
+        producer = Producer({
+            'bootstrap.servers': self.bootstrap_servers,
+        })
         
         # Send messages to different partitions using key
         partitions_used = set()
+        delivered_count = 0
+        
+        def delivery_report(err, msg):
+            nonlocal delivered_count
+            if err is None:
+                partitions_used.add(msg.partition())
+                delivered_count += 1
+        
         for i in range(20):
             key = f'key-{i % 3}'  # Should distribute across 3 partitions
-            future = producer.send(topic, key=key, value=f'msg-{i}'.encode('utf-8'))
-            record = future.get(timeout=10)
-            partitions_used.add(record.partition)
+            producer.produce(topic, key=key.encode('utf-8'), value=f'msg-{i}'.encode('utf-8'), callback=delivery_report)
         
-        producer.close()
+        producer.flush()
         
         # Verify that it used multiple partitions
         print(f"Partitions used: {partitions_used}")
+        print(f"Messages delivered: {delivered_count}")
         # Note: with Rustka's default 3 partitions, we should see distribution
         self.assertGreaterEqual(len(partitions_used), 1)
     
     def test_05_metadata_api(self):
         """Test metadata API"""
-        from kafka import KafkaClient
+        # librdkafka handles metadata internally, so we'll use AdminClient
+        admin = AdminClient({'bootstrap.servers': self.bootstrap_servers})
         
-        client = KafkaClient(bootstrap_servers=self.bootstrap_servers, api_version=(0, 10, 0))
-        client.check_version()
+        # Get cluster metadata
+        metadata = admin.list_topics(timeout=10)
         
-        # Get metadata
-        metadata = client.cluster
-        self.assertIsNotNone(metadata.brokers())
-        self.assertGreater(len(metadata.brokers()), 0)
+        self.assertIsNotNone(metadata.brokers)
+        self.assertGreater(len(metadata.brokers), 0)
         
-        broker_info = [f"{broker.nodeId}@{broker.host}:{broker.port}" for broker in metadata.brokers()]
+        broker_info = [f"{broker.id}@{broker.host}:{broker.port}" for id, broker in metadata.brokers.items()]
         print(f"Brokers: {broker_info}")
-        print(f"Topics: {list(metadata.topics())[:5]}...")  # Show first 5 topics
         
-        client.close()
+        topic_names = list(metadata.topics.keys())[:5]  # Show first 5 topics
+        print(f"Topics: {topic_names}...")
 
 if __name__ == '__main__':
     print("=== Kafka Compatibility Test Suite ===")
     print("These tests should pass with both Kafka and Rustka")
-    print("Make sure Rustka is running on localhost:9092\n")
+    print("Make sure Rustka is running on 127.0.0.1:9092\n")
     
     unittest.main(verbosity=2)

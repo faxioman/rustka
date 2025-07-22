@@ -9,11 +9,26 @@ import threading
 from collections import defaultdict
 
 try:
-    from kafka import KafkaProducer, KafkaConsumer, TopicPartition
-    from kafka.structs import OffsetAndMetadata
+    from confluent_kafka import Producer, Consumer, KafkaError, TopicPartition
+    from confluent_kafka.admin import AdminClient, NewTopic
 except ImportError:
-    print("Please install kafka-python: pip install kafka-python")
+    print("Please install confluent-kafka: pip install confluent-kafka")
     sys.exit(1)
+
+def ensure_topics(topics):
+    """Ensure topics exist"""
+    admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
+    
+    new_topics = []
+    for topic in topics:
+        new_topics.append(NewTopic(topic, num_partitions=3, replication_factor=1))
+    
+    fs = admin.create_topics(new_topics)
+    for topic, f in fs.items():
+        try:
+            f.result()
+        except Exception as e:
+            pass  # Topic might already exist
 
 def test_sentry_event_processing():
     """Simulates Sentry event processing with consumer groups"""
@@ -21,6 +36,8 @@ def test_sentry_event_processing():
     
     # Topics that Sentry uses
     topics = ['events', 'transactions', 'outcomes']
+    ensure_topics(topics)
+    
     events_processed = defaultdict(list)
     stop_flag = threading.Event()
     
@@ -34,20 +51,18 @@ def test_sentry_event_processing():
         """Simulates a Sentry worker"""
         print(f"  Worker {worker_id} starting...")
         try:
-            consumer = KafkaConsumer(
-                *topics_to_consume,
-                bootstrap_servers=['localhost:9092'],
-                group_id=group_id,
-                auto_offset_reset='earliest',
-                enable_auto_commit=False,  # Manual commit for debugging
-                value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
-                api_version=(0, 10, 0),
-                max_poll_records=500
-            )
+            consumer = Consumer({
+                'bootstrap.servers': '127.0.0.1:9092',
+                'group.id': group_id,
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False,  # Manual commit for debugging
+            })
+            
+            consumer.subscribe(topics_to_consume)
             print(f"  Worker {worker_id} connected and subscribed to {topics_to_consume}")
             
             # Force assignment check
-            consumer.poll(timeout_ms=100)
+            consumer.poll(timeout=0.1)
             assignment = consumer.assignment()
             print(f"  Worker {worker_id} assigned partitions: {assignment}")
         except Exception as e:
@@ -55,69 +70,85 @@ def test_sentry_event_processing():
             return
         
         while not stop_flag.is_set():
-            messages = consumer.poll(timeout_ms=500)
-            if messages:
-                print(f"  Worker {worker_id} received messages")
-            for topic_partition, records in messages.items():
-                for record in records:
-                    # Only count messages from this test run
-                    if record.value.get('test_run_id') == test_run_id:
-                        event_data = {
-                            'topic': record.topic,
-                            'partition': record.partition,
-                            'offset': record.offset,
-                            'value': record.value
-                        }
-                        events_processed[worker_id].append(event_data)
-                        print(f"  Worker {worker_id} processed: topic={record.topic}, partition={record.partition}, offset={record.offset}")
+            msg = consumer.poll(0.5)
+            
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(f"  Worker {worker_id} error: {msg.error()}")
+                    continue
+            
+            try:
+                value = json.loads(msg.value().decode('utf-8'))
+                # Only count messages from this test run
+                if value.get('test_run_id') == test_run_id:
+                    event_data = {
+                        'topic': msg.topic(),
+                        'partition': msg.partition(),
+                        'offset': msg.offset(),
+                        'value': value
+                    }
+                    events_processed[worker_id].append(event_data)
+                    print(f"  Worker {worker_id} processed: topic={msg.topic()}, partition={msg.partition()}, offset={msg.offset()}")
+                    # Commit offset to prevent re-reading on rebalance
+                    consumer.commit(msg)
+            except Exception as e:
+                print(f"  Worker {worker_id} decode error: {e}")
         
         consumer.close()
     
     # First produce all events
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        key_serializer=lambda k: k.encode('utf-8') if k else None,
-        api_version=(0, 10, 0)
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
+    
+    delivered = 0
+    def delivery_report(err, msg):
+        nonlocal delivered
+        if err is None:
+            delivered += 1
     
     # Produce different event types
     for i in range(10):
         # Error event
-        producer.send('events', 
-                     key=f'project-{i % 3}',
-                     value={
-                         'test_run_id': test_run_id,
-                         'type': 'error',
-                         'project_id': i % 3,
-                         'message': f'Error {i}',
-                         'timestamp': time.time()
-                     })
+        producer.produce('events', 
+                         key=f'project-{i % 3}'.encode('utf-8'),
+                         value=json.dumps({
+                             'test_run_id': test_run_id,
+                             'type': 'error',
+                             'project_id': i % 3,
+                             'message': f'Error {i}',
+                             'timestamp': time.time()
+                         }).encode('utf-8'),
+                         callback=delivery_report)
         
         # Transaction event
-        producer.send('transactions',
-                     key=f'project-{i % 3}',
-                     value={
-                         'test_run_id': test_run_id,
-                         'type': 'transaction',
-                         'project_id': i % 3,
-                         'name': f'/api/endpoint/{i}',
-                         'duration': 100 + i * 10
-                     })
+        producer.produce('transactions',
+                         key=f'project-{i % 3}'.encode('utf-8'),
+                         value=json.dumps({
+                             'test_run_id': test_run_id,
+                             'type': 'transaction',
+                             'project_id': i % 3,
+                             'name': f'/api/endpoint/{i}',
+                             'duration': 100 + i * 10
+                         }).encode('utf-8'),
+                         callback=delivery_report)
         
         # Outcome event
-        producer.send('outcomes',
-                     value={
-                         'test_run_id': test_run_id,
-                         'type': 'outcome',
-                         'outcome': 'accepted',
-                         'category': 'error'
-                     })
+        producer.produce('outcomes',
+                         value=json.dumps({
+                             'test_run_id': test_run_id,
+                             'type': 'outcome',
+                             'outcome': 'accepted',
+                             'category': 'error'
+                         }).encode('utf-8'),
+                         callback=delivery_report)
     
     producer.flush()
-    producer.close()
-    
-    print("✓ Produced 30 events")
+    print(f"✓ Produced {delivered} events")
     time.sleep(1)  # Give broker time to process
     
     # Now start workers AFTER messages are produced
@@ -166,68 +197,79 @@ def test_sentry_offset_tracking():
     test_run_id = f'offset-test-{int(time.time() * 1000)}'
     
     # Send test messages
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        api_version=(0, 10, 0)
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
+    
+    delivered = 0
+    def delivery_report(err, msg):
+        nonlocal delivered
+        if err is None:
+            delivered += 1
     
     print("  Producing test messages...")
     for i in range(10):
-        producer.send(topic, value={
+        producer.produce(topic, value=json.dumps({
             'test_run_id': test_run_id,
             'message_id': i,
             'content': f'Test message {i}'
-        })
+        }).encode('utf-8'), callback=delivery_report)
     
     producer.flush()
-    producer.close()
+    print(f"  Produced {delivered} messages")
     time.sleep(0.5)
     
     # Consumer 1: Read messages with manual commit
-    consumer1 = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        group_id=group_id,
-        enable_auto_commit=False,
-        auto_offset_reset='earliest',
-        api_version=(0, 10, 0),
-        value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-    )
+    consumer1 = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': group_id,
+        'enable.auto.commit': False,
+        'auto.offset.reset': 'earliest',
+    })
+    
+    consumer1.subscribe([topic])
     
     processed_messages = []
     print("  First consumer processing messages...")
     
     start_time = time.time()
     while len(processed_messages) < 5 and time.time() - start_time < 10:
-        messages = consumer1.poll(timeout_ms=500)
+        msg = consumer1.poll(0.5)
         
-        for topic_partition, records in messages.items():
-            for message in records:
-                if message.value.get('test_run_id') == test_run_id:
-                    processed_messages.append(message.value['message_id'])
-                    print(f"  - Processed message {message.value['message_id']}")
-                    
-                    # Commit after each message
-                    consumer1.commit()
-                    
-                    if len(processed_messages) >= 5:
-                        break
-            if len(processed_messages) >= 5:
-                break
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(f"  Consumer1 error: {msg.error()}")
+                continue
+        
+        try:
+            value = json.loads(msg.value().decode('utf-8'))
+            if value.get('test_run_id') == test_run_id:
+                processed_messages.append(value['message_id'])
+                print(f"  - Processed message {value['message_id']}")
+                
+                # Commit after each message
+                consumer1.commit()
+                
+                if len(processed_messages) >= 5:
+                    break
+        except Exception as e:
+            print(f"  Decode error: {e}")
     
     consumer1.close()
     print(f"✓ First consumer processed {len(processed_messages)} messages: {processed_messages}")
     
     # Consumer 2: Same group, should NOT get the same messages
-    consumer2 = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        group_id=group_id,
-        enable_auto_commit=False,
-        api_version=(0, 10, 0),
-        value_deserializer=lambda m: json.loads(m.decode('utf-8'))
-    )
+    consumer2 = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': group_id,
+        'enable.auto.commit': False,
+    })
+    
+    consumer2.subscribe([topic])
     
     duplicate_messages = []
     new_messages = []
@@ -235,22 +277,29 @@ def test_sentry_offset_tracking():
     print("\n  Second consumer checking for duplicates...")
     start_time = time.time()
     while time.time() - start_time < 5:
-        messages = consumer2.poll(timeout_ms=500)
+        msg = consumer2.poll(0.5)
         
-        if not messages:
+        if msg is None:
             continue
-            
-        for topic_partition, records in messages.items():
-            for message in records:
-                if message.value.get('test_run_id') == test_run_id:
-                    msg_id = message.value['message_id']
-                    
-                    if msg_id in processed_messages:
-                        duplicate_messages.append(msg_id)
-                        print(f"  ✗ DUPLICATE: Second consumer got already-processed message {msg_id}")
-                    else:
-                        new_messages.append(msg_id)
-                        print(f"  - Second consumer got new message {msg_id}")
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                continue
+        
+        try:
+            value = json.loads(msg.value().decode('utf-8'))
+            if value.get('test_run_id') == test_run_id:
+                msg_id = value['message_id']
+                
+                if msg_id in processed_messages:
+                    duplicate_messages.append(msg_id)
+                    print(f"  ✗ DUPLICATE: Second consumer got already-processed message {msg_id}")
+                else:
+                    new_messages.append(msg_id)
+                    print(f"  - Second consumer got new message {msg_id}")
+        except Exception as e:
+            print(f"  Decode error: {e}")
     
     consumer2.close()
     
@@ -281,51 +330,43 @@ def test_sentry_high_throughput():
     start_time = time.time()
     
     # Produce many events quickly
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        batch_size=16384,  # Batch for efficiency
-        linger_ms=10,
-        api_version=(0, 10, 0)
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'batch.size': 16384,  # Batch for efficiency
+        'linger.ms': 10,
+    })
     
-    futures = []
+    delivered = 0
+    def delivery_report(err, msg):
+        nonlocal delivered
+        if err is None:
+            delivered += 1
+    
     for i in range(num_events):
-        future = producer.send('events', value={
+        producer.produce('events', value=json.dumps({
             'test_run_id': test_run_id,
             'event_id': i,
             'timestamp': time.time(),
             'data': 'x' * 1000  # 1KB payload
-        })
-        futures.append(future)
+        }).encode('utf-8'), callback=delivery_report)
     
-    # Wait for all sends
-    for future in futures:
-        try:
-            future.get(timeout=10)
-        except Exception as e:
-            print(f"✗ Failed to send: {e}")
-            return False
-    
-    producer.close()
+    producer.flush()
     
     produce_time = time.time() - start_time
-    events_per_second = num_events / produce_time
+    events_per_second = delivered / produce_time if produce_time > 0 else 0
     
-    print(f"✓ Produced {num_events} events in {produce_time:.2f}s ({events_per_second:.0f} events/sec)")
+    print(f"✓ Produced {delivered} events in {produce_time:.2f}s ({events_per_second:.0f} events/sec)")
     
     # Consume with high throughput settings
-    consumer = KafkaConsumer(
-        'events',
-        bootstrap_servers=['localhost:9092'],
-        group_id=f'perf-test-{int(time.time())}',
-        auto_offset_reset='earliest',
-        fetch_min_bytes=1,  # Don't wait for more bytes
-        fetch_max_wait_ms=10,  # Reduce wait time
-        max_poll_records=500,  # Get more records per poll
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
-        api_version=(0, 10, 0)
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'perf-test-{int(time.time())}',
+        'auto.offset.reset': 'earliest',
+        'fetch.min.bytes': 1,  # Don't wait for more bytes
+        'fetch.wait.max.ms': 10,  # Reduce wait time
+    })
+    
+    consumer.subscribe(['events'])
     
     start_time = time.time()
     consumed = 0
@@ -333,22 +374,31 @@ def test_sentry_high_throughput():
     poll_count = 0
     while consumed < num_events:
         poll_count += 1
-        messages = consumer.poll(timeout_ms=100, max_records=500)
+        msg = consumer.poll(0.1)
         
-        if messages:
-            for topic_partition, records in messages.items():
-                # Count only messages from this test run
-                test_messages = [r for r in records if r.value.get('test_run_id') == test_run_id]
-                consumed += len(test_messages)
-                if test_messages:
-                    print(f"  Poll {poll_count}: got {len(test_messages)} test messages from {topic_partition}")
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                continue
+        
+        try:
+            value = json.loads(msg.value().decode('utf-8'))
+            if value.get('test_run_id') == test_run_id:
+                consumed += 1
+                if consumed % 10 == 0:
+                    print(f"  Consumed {consumed} messages")
+        except:
+            pass
         
         if time.time() - start_time > 10:
             print(f"⚠ Timeout after {poll_count} polls")
             break
     
     consume_time = time.time() - start_time
-    consume_rate = consumed / consume_time
+    consume_rate = consumed / consume_time if consume_time > 0 else 0
     
     consumer.close()
     

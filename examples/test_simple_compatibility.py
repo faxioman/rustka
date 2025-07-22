@@ -5,30 +5,62 @@ Simple Kafka compatibility test
 import sys
 
 try:
-    from kafka import KafkaProducer, KafkaConsumer
-    print("✓ kafka-python installed")
+    from confluent_kafka import Producer, Consumer, KafkaError, TopicPartition
+    from confluent_kafka.admin import AdminClient, NewTopic
+    print("✓ confluent-kafka installed")
 except ImportError:
-    print("✗ kafka-python not installed. Please run: pip install kafka-python")
+    print("✗ confluent-kafka not installed. Please run: pip install confluent-kafka")
     sys.exit(1)
 
 import json
 import time
 
+def ensure_topic(topic_name):
+    """Ensure topic exists"""
+    admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
+    
+    try:
+        new_topic = NewTopic(topic_name, num_partitions=1, replication_factor=1)
+        fs = admin.create_topics([new_topic])
+        for topic, f in fs.items():
+            try:
+                f.result()
+            except Exception as e:
+                pass  # Topic might already exist
+    except Exception as e:
+        pass
+
 def test_basic_produce_consume():
     """Basic produce/consume test"""
     print("\n1. Testing basic produce...")
     
+    # Ensure topic exists
+    ensure_topic('test-topic')
+    
     try:
-        producer = KafkaProducer(
-            bootstrap_servers=['localhost:9092'],
-            api_version=(0, 10, 0),
-            request_timeout_ms=5000
-        )
+        producer = Producer({
+            'bootstrap.servers': '127.0.0.1:9092',
+        })
         
-        future = producer.send('test-topic', b'Hello Rustka!')
-        result = future.get(timeout=5)
-        print(f"✓ Produced message to partition {result.partition} offset {result.offset}")
-        producer.close()
+        delivered = False
+        partition = None
+        offset = None
+        
+        def delivery_report(err, msg):
+            nonlocal delivered, partition, offset
+            if err is None:
+                delivered = True
+                partition = msg.partition()
+                offset = msg.offset()
+        
+        producer.produce('test-topic', b'Hello Rustka!', callback=delivery_report)
+        producer.flush(timeout=5)
+        
+        if delivered:
+            print(f"✓ Produced message to partition {partition} offset {offset}")
+        else:
+            print("✗ Failed to deliver message")
+            return False
         
     except Exception as e:
         print(f"✗ Producer failed: {e}")
@@ -37,18 +69,25 @@ def test_basic_produce_consume():
     print("\n2. Testing basic consume...")
     
     try:
-        consumer = KafkaConsumer(
-            'test-topic',
-            bootstrap_servers=['localhost:9092'],
-            auto_offset_reset='earliest',
-            consumer_timeout_ms=5000,
-            api_version=(0, 10, 0)
-        )
+        consumer = Consumer({
+            'bootstrap.servers': '127.0.0.1:9092',
+            'group.id': f'test-basic-{int(time.time())}',
+            'auto.offset.reset': 'earliest',
+        })
+        
+        consumer.subscribe(['test-topic'])
         
         message_found = False
-        for message in consumer:
-            if message.value == b'Hello Rustka!':
-                print(f"✓ Consumed message: {message.value.decode()}")
+        start_time = time.time()
+        while time.time() - start_time < 5:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+            elif msg.value() == b'Hello Rustka!':
+                print(f"✓ Consumed message: {msg.value().decode()}")
                 message_found = True
                 break
         
@@ -73,38 +112,50 @@ def test_consumer_group():
         topic_name = f'test-cg-topic-{int(time.time())}'
         group_id = f'test-group-{int(time.time())}'
         
+        # Ensure topic exists
+        ensure_topic(topic_name)
+        
         # Produce a message first
-        producer = KafkaProducer(
-            bootstrap_servers=['localhost:9092'],
-            api_version=(0, 10, 0)
-        )
+        producer = Producer({
+            'bootstrap.servers': '127.0.0.1:9092',
+        })
         
         test_msg = f'Group test at {time.time()}'
-        producer.send(topic_name, test_msg.encode())
+        producer.produce(topic_name, test_msg.encode())
         producer.flush()
-        producer.close()
         
         # Consumer with group
-        consumer = KafkaConsumer(
-            topic_name,
-            bootstrap_servers=['localhost:9092'],
-            group_id=group_id,
-            auto_offset_reset='earliest',
-            enable_auto_commit=True,
-            api_version=(0, 10, 0)
-        )
+        consumer = Consumer({
+            'bootstrap.servers': '127.0.0.1:9092',
+            'group.id': group_id,
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': True,
+        })
         
+        consumer.subscribe([topic_name])
         print(f"✓ Joined consumer group '{group_id}'")
         
         # Try to consume
-        messages = consumer.poll(timeout_ms=5000)
-        if messages:
-            print(f"✓ Consumed {sum(len(msgs) for msgs in messages.values())} messages in group")
-            consumer.close()
+        messages_consumed = 0
+        start_time = time.time()
+        while time.time() - start_time < 5:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+            else:
+                messages_consumed += 1
+                print(f"✓ Consumed {messages_consumed} messages in group")
+                break
+        
+        consumer.close()
+        
+        if messages_consumed > 0:
             return True
         else:
             print("✗ No messages consumed")
-            consumer.close()
             return False
         
     except Exception as e:
@@ -119,45 +170,68 @@ def test_offset_management():
         group_id = f'test-offset-group-{int(time.time())}'
         
         # First consumer: read and commit
-        consumer1 = KafkaConsumer(
-            'test-topic',
-            bootstrap_servers=['localhost:9092'],
-            group_id=group_id,
-            enable_auto_commit=False,
-            auto_offset_reset='earliest',
-            api_version=(0, 10, 0)
-        )
+        consumer1 = Consumer({
+            'bootstrap.servers': '127.0.0.1:9092',
+            'group.id': group_id,
+            'enable.auto.commit': False,
+            'auto.offset.reset': 'earliest',
+        })
+        
+        consumer1.subscribe(['test-topic'])
         
         # Read one message and commit
-        for message in consumer1:
-            print(f"✓ Consumer 1 read offset {message.offset}")
-            consumer1.commit()
-            break
+        committed_offset = None
+        partition_used = None
+        start_time = time.time()
+        while time.time() - start_time < 5:
+            msg = consumer1.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+            else:
+                print(f"✓ Consumer 1 read offset {msg.offset()}")
+                committed_offset = msg.offset()
+                partition_used = msg.partition()
+                consumer1.commit()
+                break
         
         consumer1.close()
         
+        if committed_offset is None:
+            print("✗ No message to commit")
+            return False
+        
         # Second consumer: should start after committed offset
-        consumer2 = KafkaConsumer(
-            'test-topic',
-            bootstrap_servers=['localhost:9092'],
-            group_id=group_id,
-            enable_auto_commit=False,
-            api_version=(0, 10, 0)
-        )
+        consumer2 = Consumer({
+            'bootstrap.servers': '127.0.0.1:9092',
+            'group.id': group_id,
+            'enable.auto.commit': False,
+        })
+        
+        consumer2.subscribe(['test-topic'])
         
         # Poll to trigger assignment
-        consumer2.poll(timeout_ms=1000)
+        consumer2.poll(timeout=1.0)
         
         # Check committed offset
-        for partition in consumer2.assignment():
-            committed = consumer2.committed(partition)
-            if committed is not None:
-                print(f"✓ Consumer 2 sees committed offset: {committed}")
-            else:
-                print("✗ No committed offset found")
+        assignment = consumer2.assignment()
+        if assignment:
+            for partition in assignment:
+                if partition.partition == partition_used:
+                    committed_list = consumer2.committed([partition])
+                    if committed_list and committed_list[0].offset >= 0:
+                        print(f"✓ Consumer 2 sees committed offset: {committed_list[0].offset}")
+                        consumer2.close()
+                        return True
+            
+            print("✗ No committed offset found for partition")
+        else:
+            print("✗ No assignment for consumer 2")
         
         consumer2.close()
-        return True
+        return False
         
     except Exception as e:
         print(f"✗ Offset management failed: {e}")

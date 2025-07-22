@@ -1,91 +1,111 @@
 #!/usr/bin/env python3
 """
-Test consumer groups with Rustka
+Test consumer groups with Rustka using librdkafka
 """
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer, KafkaError
 import json
 import time
 import threading
 
 def producer_thread(topic_name):
     """Produce messages continuously"""
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        api_version=(0, 10, 0)
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
+    
+    def delivery_report(err, msg):
+        if err is not None:
+            print(f"Delivery failed: {err}")
     
     for i in range(100):
         msg = {'index': i, 'timestamp': time.time()}
-        producer.send(topic_name, msg, partition=i % 3)  # 3 partitions
+        value = json.dumps(msg).encode('utf-8')
+        producer.produce(topic_name, value, partition=i % 3, callback=delivery_report)
         print(f"Produced: {msg}")
+        producer.poll(0)  # Trigger delivery reports
         time.sleep(0.5)
     
-    producer.close()
+    producer.flush()
 
 def consumer_in_group(consumer_id, topic_name, group_id='test-group'):
     """Consumer that is part of a consumer group"""
-    consumer = KafkaConsumer(
-        topic_name,
-        bootstrap_servers=['localhost:9092'],
-        group_id=group_id,
-        auto_offset_reset='earliest',
-        enable_auto_commit=True,
-        auto_commit_interval_ms=5000,
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-        api_version=(0, 10, 0)
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': group_id,
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': True,
+        'auto.commit.interval.ms': 5000,
+        'client.id': f'consumer-{consumer_id}',
+    })
     
+    consumer.subscribe([topic_name])
     print(f"Consumer {consumer_id} started in group {group_id}")
     
     try:
-        for message in consumer:
-            print(f"Consumer {consumer_id} consumed: {message.value} from partition {message.partition}")
+        while True:
+            msg = consumer.poll(1.0)
+            
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(f"Consumer {consumer_id} error: {msg.error()}")
+                    continue
+            
+            try:
+                value = json.loads(msg.value().decode('utf-8'))
+                print(f"Consumer {consumer_id} consumed: {value} from partition {msg.partition()}")
+            except Exception as e:
+                print(f"Consumer {consumer_id} decode error: {e}")
+                print(f"Debug - Raw message value: {msg.value()}")
+                
     except KeyboardInterrupt:
         pass
     except Exception as e:
         print(f"Consumer {consumer_id} error: {type(e).__name__}: {e}")
-        # Print raw message for debugging
-        print(f"Debug - Raw message value: {message.value if 'message' in locals() else 'N/A'}")
     finally:
         consumer.close()
-        print(f"Consumer {consumer_id} stopped")
 
-def test_consumer_groups():
-    print("Testing Rustka Consumer Groups...")
+def test_consumer_group():
+    """Test multiple consumers in a group"""
+    topic = f'test-group-{int(time.time())}'
     
-    # Use unique topic name to avoid conflicts
-    topic_name = f'test-consumer-group-{int(time.time())}'
-    group_id = f'test-group-{int(time.time())}'
+    # Pre-create topic by producing one message
+    producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
+    producer.produce(topic, b'init', partition=0)
+    producer.flush()
+    
+    print(f"Testing consumer group with topic: {topic}")
     
     # Start producer in background
-    producer = threading.Thread(target=producer_thread, args=(topic_name,), daemon=True)
-    producer.start()
+    producer_t = threading.Thread(target=producer_thread, args=(topic,))
+    producer_t.daemon = True
+    producer_t.start()
     
-    # Start 3 consumers in the same group
+    # Start consumers
     consumers = []
     for i in range(3):
         t = threading.Thread(
             target=consumer_in_group, 
-            args=(f"consumer-{i}", topic_name, group_id),
-            daemon=True
+            args=(i, topic)
         )
+        t.daemon = True
         t.start()
         consumers.append(t)
-        time.sleep(1)  # Give time for join
+        time.sleep(1)  # Stagger consumer starts
     
-    print(f"\n3 consumers running in group '{group_id}' on topic '{topic_name}'")
-    print("Each should handle different partitions.")
-    print("Press Ctrl+C to stop...\n")
+    print("\nRunning for 20 seconds...")
+    print("You should see partitions distributed among consumers")
+    print("Press Ctrl+C to stop\n")
     
     try:
-        # Wait for producer to finish
-        producer.join()
-        # Wait a bit more to see consumers process
-        time.sleep(5)
+        time.sleep(20)
     except KeyboardInterrupt:
         print("\nStopping...")
+    
+    print("\nTest completed")
 
 if __name__ == "__main__":
-    test_consumer_groups()
+    test_consumer_group()

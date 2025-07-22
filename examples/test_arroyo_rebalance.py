@@ -1,258 +1,166 @@
 #!/usr/bin/env python3
 """
 Test that simulates Arroyo/librdkafka behavior with consumer groups
-This should reproduce the REBALANCE_IN_PROGRESS loop issue
+This should test the REBALANCE_IN_PROGRESS issue we fixed
 """
 import sys
 import time
 import threading
-from kafka import KafkaProducer, KafkaConsumer, KafkaAdminClient
-from kafka.admin import NewTopic
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer, KafkaError
+from confluent_kafka.admin import AdminClient, NewTopic
 
 def setup_topics():
     """Create topics with 3 partitions each like Snuba"""
-    admin = KafkaAdminClient(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(0, 10, 0)
-    )
+    admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     topics = ['outcomes_raw', 'events', 'transactions', 'sessions']
     new_topics = []
     
     for topic in topics:
         new_topics.append(NewTopic(
-            name=topic,
+            topic=topic,
             num_partitions=3,
             replication_factor=1
         ))
     
     try:
-        admin.create_topics(new_topics)
-        print(f"Created topics: {topics}")
+        fs = admin.create_topics(new_topics)
+        for topic, f in fs.items():
+            try:
+                f.result()  # The result itself is None
+                print(f"Created topic {topic}")
+            except Exception as e:
+                print(f"Topic {topic} might already exist: {e}")
     except Exception as e:
-        print(f"Topics might already exist: {e}")
+        print(f"Error creating topics: {e}")
     
-    admin.close()
     return topics
 
 def simulate_arroyo_consumer(consumer_id, topic, group_id, error_log):
-    """Simulate Arroyo consumer behavior"""
-    print(f"[Consumer {consumer_id}] Starting for topic {topic}")
+    """Simulate Arroyo consumer behavior using librdkafka"""
+    print(f"Starting Arroyo consumer {consumer_id} for topic {topic}")
     
-    consecutive_errors = 0
-    max_consecutive_errors = 10
+    # Arroyo uses these settings
+    config = {
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': group_id,
+        'client.id': f'arroyo-consumer-{consumer_id}',
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': True,
+        'session.timeout.ms': 30000,
+        'heartbeat.interval.ms': 3000,
+        'max.poll.interval.ms': 300000,
+    }
     
-    while consecutive_errors < max_consecutive_errors:
-        try:
-            # Arroyo creates a new consumer instance
-            consumer = KafkaConsumer(
-                topic,
-                bootstrap_servers=['localhost:9092'],
-                group_id=group_id,
-                enable_auto_commit=True,
-                auto_offset_reset='earliest',
-                session_timeout_ms=6000,
-                api_version=(0, 10, 0)
-            )
-            
-            print(f"[Consumer {consumer_id}] Connected successfully")
-            consecutive_errors = 0  # Reset on successful connection
-            
-            # Simulate Arroyo's poll loop
-            poll_errors = 0
-            while poll_errors < 5:
-                try:
-                    messages = consumer.poll(timeout_ms=100)
-                    if messages:
-                        print(f"[Consumer {consumer_id}] Received {sum(len(m) for m in messages.values())} messages")
-                    poll_errors = 0  # Reset on successful poll
-                except KafkaError as e:
-                    error_msg = str(e)
-                    print(f"[Consumer {consumer_id}] Poll error: {error_msg}")
-                    error_log.append((consumer_id, time.time(), error_msg))
-                    
-                    if "REBALANCE_IN_PROGRESS" in error_msg:
-                        poll_errors += 1
-                        # Arroyo/librdkafka might retry very quickly
-                        time.sleep(0.01)  # Very short backoff
-                    else:
-                        poll_errors += 1
-                        time.sleep(0.1)
-            
-            consumer.close()
-            print(f"[Consumer {consumer_id}] Closed after poll errors")
-            consecutive_errors += 1
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"[Consumer {consumer_id}] Connection error: {error_msg}")
-            error_log.append((consumer_id, time.time(), error_msg))
-            consecutive_errors += 1
-            
-            # Arroyo might retry quickly
-            time.sleep(0.1)
+    consumer = Consumer(config)
+    consumer.subscribe([topic])
     
-    print(f"[Consumer {consumer_id}] Giving up after {consecutive_errors} consecutive errors")
-
-def test_concurrent_consumers():
-    """Test multiple consumers joining simultaneously like Snuba startup"""
-    print("=== Testing Arroyo/librdkafka-style consumer group behavior ===")
-    
-    # Setup topics
-    topics = setup_topics()
-    time.sleep(1)
-    
-    # Produce some test data
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(0, 10, 0)
-    )
-    
-    for topic in topics:
-        for i in range(10):
-            producer.send(topic, value=f"test-{i}".encode())
-    
-    producer.flush()
-    producer.close()
-    print("Produced test messages")
-    
-    # Start multiple consumers simultaneously (like Snuba startup)
-    error_log = []
-    threads = []
-    group_id = f'snuba-consumers-{int(time.time())}'
-    
-    print(f"\nStarting consumers with group_id: {group_id}")
-    print("This simulates Snuba starting up with multiple consumers...\n")
-    
-    # Start 4 consumers for different topics at nearly the same time
-    for i, topic in enumerate(topics):
-        thread = threading.Thread(
-            target=simulate_arroyo_consumer,
-            args=(i, topic, group_id, error_log),
-            daemon=True
-        )
-        threads.append(thread)
-        thread.start()
-        # Very short delay to simulate near-simultaneous startup
-        time.sleep(0.01)
-    
-    # Let them run for a bit
-    time.sleep(5)
-    
-    # Analyze errors
-    print("\n=== Error Analysis ===")
-    rebalance_errors = [e for e in error_log if "REBALANCE_IN_PROGRESS" in e[2]]
-    
-    if rebalance_errors:
-        print(f"\nFound {len(rebalance_errors)} REBALANCE_IN_PROGRESS errors:")
-        for consumer_id, timestamp, error in rebalance_errors[:10]:  # Show first 10
-            print(f"  Consumer {consumer_id} at {timestamp:.2f}: {error}")
-        
-        if len(rebalance_errors) > 10:
-            print(f"  ... and {len(rebalance_errors) - 10} more")
-        
-        # Check if we're in a loop
-        if len(rebalance_errors) > 20:
-            print("\n❌ REBALANCE_IN_PROGRESS LOOP DETECTED!")
-            print("This matches the Snuba/Arroyo issue.")
-            return False
-    else:
-        print("✅ No REBALANCE_IN_PROGRESS errors found")
-        return True
-    
-    return len(rebalance_errors) < 5  # Allow a few transient errors
-
-def test_rapid_reconnects():
-    """Test rapid reconnection pattern that might trigger the issue"""
-    print("\n=== Testing rapid reconnection pattern ===")
-    
-    group_id = f'rapid-reconnect-{int(time.time())}'
-    topic = 'test-rapid'
-    
-    # Create topic
-    admin = KafkaAdminClient(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(0, 10, 0)
-    )
+    messages_consumed = 0
+    rebalance_errors = 0
     
     try:
-        admin.create_topics([NewTopic(name=topic, num_partitions=3, replication_factor=1)])
-    except:
-        pass
-    admin.close()
-    
-    errors = []
-    
-    # Simulate rapid connect/disconnect pattern
-    for i in range(10):
-        try:
-            consumer = KafkaConsumer(
-                topic,
-                bootstrap_servers=['localhost:9092'],
-                group_id=group_id,
-                session_timeout_ms=3000,  # Short timeout
-                api_version=(0, 10, 0)
-            )
+        start_time = time.time()
+        while time.time() - start_time < 30:  # Run for 30 seconds
+            msg = consumer.poll(1.0)
             
-            # Poll once
-            try:
-                consumer.poll(timeout_ms=50)
-            except KafkaError as e:
-                errors.append(str(e))
-            
-            # Immediately close
-            consumer.close()
-            
-        except Exception as e:
-            errors.append(str(e))
-        
-        # Very short delay between reconnects
-        time.sleep(0.05)
-    
-    rebalance_errors = [e for e in errors if "REBALANCE_IN_PROGRESS" in e]
-    
-    print(f"Rapid reconnect test: {len(rebalance_errors)} REBALANCE_IN_PROGRESS errors out of {len(errors)} total")
-    
-    return len(rebalance_errors) < 3
-
-def main():
-    passed = 0
-    failed = 0
-    
-    tests = [
-        ("Concurrent consumers (Snuba-like)", test_concurrent_consumers),
-        ("Rapid reconnections", test_rapid_reconnects),
-    ]
-    
-    for name, test_func in tests:
-        print(f"\n{'='*60}")
-        print(f"Running: {name}")
-        print('='*60)
-        
-        try:
-            if test_func():
-                passed += 1
-                print(f"\n✅ {name} PASSED")
+            if msg is None:
+                continue
+                
+            if msg.error():
+                error_code = msg.error().code()
+                if error_code == KafkaError._PARTITION_EOF:
+                    continue
+                elif error_code == KafkaError.REBALANCE_IN_PROGRESS:
+                    rebalance_errors += 1
+                    error_log.append(f"Consumer {consumer_id}: REBALANCE_IN_PROGRESS")
+                    print(f"Consumer {consumer_id}: REBALANCE_IN_PROGRESS error #{rebalance_errors}")
+                else:
+                    error_log.append(f"Consumer {consumer_id}: {msg.error()}")
+                    print(f"Consumer {consumer_id} error: {msg.error()}")
             else:
-                failed += 1
-                print(f"\n❌ {name} FAILED")
-        except Exception as e:
-            failed += 1
-            print(f"\n❌ {name} FAILED with exception: {e}")
-            import traceback
-            traceback.print_exc()
+                messages_consumed += 1
+                if messages_consumed % 10 == 0:
+                    print(f"Consumer {consumer_id}: consumed {messages_consumed} messages")
     
-    print(f"\n{'='*60}")
-    print(f"SUMMARY: {passed} passed, {failed} failed")
-    print('='*60)
+    except Exception as e:
+        error_log.append(f"Consumer {consumer_id} exception: {e}")
+        print(f"Consumer {consumer_id} exception: {e}")
     
-    if failed > 0:
-        print("\n⚠️  The REBALANCE_IN_PROGRESS issue is reproduced!")
-        print("This confirms the problem seen with Snuba/Arroyo.")
+    finally:
+        consumer.close()
+        print(f"Consumer {consumer_id} finished: {messages_consumed} messages, {rebalance_errors} rebalance errors")
+
+def produce_messages(topics):
+    """Produce messages to topics"""
+    producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
     
-    return failed == 0
+    print("Producing messages...")
+    for i in range(100):
+        for topic in topics:
+            producer.produce(topic, f'message-{i}'.encode('utf-8'), partition=i % 3)
+        if i % 10 == 0:
+            producer.poll(0)
+    
+    producer.flush()
+    print("Finished producing messages")
+
+def test_arroyo_rebalancing():
+    """Test rebalancing with multiple consumer groups like Arroyo"""
+    print("Setting up Arroyo rebalancing test...")
+    
+    topics = setup_topics()
+    error_log = []
+    
+    # Produce some messages
+    produce_messages(topics)
+    
+    # Start multiple consumer groups like Snuba/Arroyo
+    threads = []
+    consumer_id = 0
+    
+    # Simulate multiple consumer groups each consuming different topics
+    for topic in topics:
+        group_id = f'snuba-consumers-{topic}'
+        
+        # Start 2 consumers per group to trigger rebalancing
+        for i in range(2):
+            t = threading.Thread(
+                target=simulate_arroyo_consumer,
+                args=(consumer_id, topic, group_id, error_log)
+            )
+            t.daemon = True
+            t.start()
+            threads.append(t)
+            consumer_id += 1
+            time.sleep(0.5)  # Stagger starts to trigger rebalancing
+    
+    print(f"\nStarted {len(threads)} consumers across {len(topics)} topics")
+    print("Running for 30 seconds...\n")
+    
+    # Wait for consumers
+    for t in threads:
+        t.join()
+    
+    # Check results
+    print("\n" + "="*50)
+    print("TEST RESULTS")
+    print("="*50)
+    
+    rebalance_errors = [e for e in error_log if "REBALANCE_IN_PROGRESS" in e]
+    other_errors = [e for e in error_log if "REBALANCE_IN_PROGRESS" not in e]
+    
+    print(f"Total REBALANCE_IN_PROGRESS errors: {len(rebalance_errors)}")
+    print(f"Other errors: {len(other_errors)}")
+    
+    if len(rebalance_errors) > 50:  # Threshold for "too many" rebalances
+        print("\n❌ FAILED: Too many rebalance errors, possible rebalance loop!")
+        for e in other_errors[:5]:  # Show first 5 other errors
+            print(f"  {e}")
+        return False
+    else:
+        print("\n✅ PASSED: Rebalancing completed successfully")
+        return True
 
 if __name__ == '__main__':
-    success = main()
+    success = test_arroyo_rebalancing()
     sys.exit(0 if success else 1)

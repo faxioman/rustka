@@ -3,8 +3,26 @@
 
 import time
 import struct
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer, KafkaError
+from confluent_kafka.admin import AdminClient, NewTopic
+
+def ensure_topic(topic_name):
+    """Ensure topic exists"""
+    admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
+    
+    try:
+        # Try to create the topic
+        topic = NewTopic(topic_name, num_partitions=1, replication_factor=1)
+        fs = admin.create_topics([topic])
+        for topic, f in fs.items():
+            try:
+                f.result()  # The result itself is None
+                print(f"Created topic {topic}")
+            except Exception as e:
+                # Topic might already exist
+                pass
+    except Exception as e:
+        pass
 
 def test_headers():
     """Test complete headers functionality"""
@@ -12,10 +30,9 @@ def test_headers():
     
     # Test 1: Basic headers with new API
     print("\n1. Testing basic headers...")
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(2, 1, 0),
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
     
     headers = [
         ('version', b'1.0'),
@@ -23,22 +40,32 @@ def test_headers():
         ('timestamp', str(int(time.time())).encode()),
     ]
     
-    try:
-        future = producer.send('test-headers-basic', value=b'Basic test', headers=headers)
-        future.get(timeout=10)
+    ensure_topic('test-headers-basic')
+    
+    delivered = False
+    error_msg = None
+    
+    def delivery_report(err, msg):
+        nonlocal delivered, error_msg
+        if err is not None:
+            error_msg = str(err)
+        else:
+            delivered = True
+    
+    producer.produce('test-headers-basic', value=b'Basic test', headers=headers, callback=delivery_report)
+    producer.flush(timeout=10)
+    
+    if delivered:
         print("✓ Basic headers sent successfully")
-    except KafkaError as e:
-        print(f"✗ Failed to send basic headers: {e}")
+    else:
+        print(f"✗ Failed to send basic headers: {error_msg}")
         return False
-    finally:
-        producer.close()
     
     # Test 2: Sentry-style headers (version as 4-byte int)
     print("\n2. Testing Sentry-style headers...")
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(2, 0, 0),
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
     
     sentry_headers = [
         ('version', struct.pack('>i', 2)),
@@ -46,51 +73,75 @@ def test_headers():
         ('project_id', struct.pack('>q', 1)),
     ]
     
-    try:
-        future = producer.send('test-headers-sentry', value=b'{"event": "test"}', headers=sentry_headers)
-        future.get(timeout=10)
+    ensure_topic('test-headers-sentry')
+    
+    delivered = False
+    error_msg = None
+    
+    def delivery_report2(err, msg):
+        nonlocal delivered, error_msg
+        if err is not None:
+            error_msg = str(err)
+        else:
+            delivered = True
+    
+    producer.produce('test-headers-sentry', value=b'{"event": "test"}', headers=sentry_headers, callback=delivery_report2)
+    producer.flush(timeout=10)
+    
+    if delivered:
         print("✓ Sentry-style headers sent successfully")
-    except KafkaError as e:
-        print(f"✗ Failed to send Sentry headers: {e}")
+    else:
+        print(f"✗ Failed to send Sentry headers: {error_msg}")
         return False
-    finally:
-        producer.close()
     
     # Test 3: Headers with old fetch API (regression test for Sentry)
     print("\n3. Testing headers with old consumer API...")
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(2, 1, 0),
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
     
-    try:
-        future = producer.send('test-headers-old-api', value=b'Old API test', 
-                             headers=[('version', struct.pack('>i', 1))])
-        future.get(timeout=10)
-    except KafkaError as e:
-        print(f"✗ Failed to send for old API test: {e}")
+    ensure_topic('test-headers-old-api')
+    
+    delivered = False
+    error_msg = None
+    
+    def delivery_report3(err, msg):
+        nonlocal delivered, error_msg
+        if err is not None:
+            error_msg = str(err)
+        else:
+            delivered = True
+    
+    producer.produce('test-headers-old-api', value=b'Old API test', 
+                     headers=[('version', struct.pack('>i', 1))], callback=delivery_report3)
+    producer.flush(timeout=10)
+    
+    if delivered:
+        print("✓ Message sent for old API test")
+    else:
+        print(f"✗ Failed to send for old API test: {error_msg}")
         return False
-    finally:
-        producer.close()
     
     # Verify all messages with headers
     print("\n4. Verifying headers...")
     all_passed = True
     
     # Check basic headers
-    consumer = KafkaConsumer(
-        'test-headers-basic',
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        api_version=(2, 1, 0),
-        consumer_timeout_ms=3000,
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'test-headers-group-{int(time.time())}',
+        'auto.offset.reset': 'earliest',
+    })
+    
+    consumer.subscribe(['test-headers-basic'])
     
     found = False
-    for msg in consumer:
-        if msg.headers:
-            header_dict = dict(msg.headers)
-            if 'version' in header_dict or b'version' in header_dict:
+    start_time = time.time()
+    while time.time() - start_time < 3:
+        msg = consumer.poll(0.5)
+        if msg and not msg.error() and msg.headers():
+            header_dict = dict(msg.headers())
+            if 'version' in header_dict:
                 found = True
                 break
     consumer.close()
@@ -102,19 +153,21 @@ def test_headers():
         all_passed = False
     
     # Check Sentry headers
-    consumer = KafkaConsumer(
-        'test-headers-sentry',
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        api_version=(2, 0, 0),
-        consumer_timeout_ms=3000,
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'test-headers-sentry-group-{int(time.time())}',
+        'auto.offset.reset': 'earliest',
+    })
+    
+    consumer.subscribe(['test-headers-sentry'])
     
     found = False
-    for msg in consumer:
-        if msg.headers:
-            header_dict = dict(msg.headers)
-            version_bytes = header_dict.get('version') or header_dict.get(b'version')
+    start_time = time.time()
+    while time.time() - start_time < 3:
+        msg = consumer.poll(0.5)
+        if msg and not msg.error() and msg.headers():
+            header_dict = dict(msg.headers())
+            version_bytes = header_dict.get('version')
             if version_bytes:
                 version = struct.unpack('>i', version_bytes)[0]
                 if version == 2:
@@ -129,17 +182,19 @@ def test_headers():
         all_passed = False
     
     # Check old API compatibility
-    consumer = KafkaConsumer(
-        'test-headers-old-api',
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        api_version=(1, 0, 0),  # OLD API
-        consumer_timeout_ms=3000,
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'test-headers-old-api-group-{int(time.time())}',
+        'auto.offset.reset': 'earliest',
+    })
+    
+    consumer.subscribe(['test-headers-old-api'])
     
     found = False
-    for msg in consumer:
-        if msg.headers:
+    start_time = time.time()
+    while time.time() - start_time < 3:
+        msg = consumer.poll(0.5)
+        if msg and not msg.error() and msg.headers():
             found = True
             break
     consumer.close()

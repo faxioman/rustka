@@ -45,17 +45,15 @@ python3 examples/test_minimal.py
 ```
 
 ## Recent Work
-- Fixed REBALANCE_IN_PROGRESS loop caused by librdkafka/Arroyo phantom members
-- The issue: librdkafka creates thousands of temporary connections during initialization
-  - Each connection joins as a new member but never completes the protocol
-  - This causes groups to accumulate 2000+ phantom members in seconds
-  - The broker waits forever for these members to rejoin, causing perpetual rebalancing
-- Solution: Aggressive cleanup of phantom members during JOIN_GROUP
-  - Members without recent heartbeats (>100ms) are removed during rebalancing
-  - Adaptive rebalance timing based on group size
-  - Limit on maximum members per group during rebalancing
-  - Prevents accumulation of temporary connections
-  - Allows real consumers to work despite phantom connection storm
+- Working on fixing consumer group rebalancing issues
+- The issue: Multiple members are being created when clients connect
+  - This is NOT due to "phantom connections" - those don't exist
+  - The problem is in how we handle the consumer group protocol flow
+  - We need to correctly implement the state machine and member management
+- Current focus: Fixing the consumer group protocol implementation
+  - Proper handling of JoinGroup/SyncGroup state transitions
+  - Correct assignment encoding for different client libraries
+  - Managing member lifecycle according to Kafka protocol specifications
 
 ## Important Notes
 
@@ -68,11 +66,11 @@ The Kafka consumer group protocol works as follows:
 5. Leader sends assignments via SyncGroup
 6. Each member receives only its own assignment
 
-### kafka-python Behavior
-- Creates many temporary connections during initialization
-- Each connection gets a new member ID
-- This can cause thousands of members during rebalancing
-- Solution: 1-second timeout to collect members before completing rebalance
+### Client Library Behaviors
+- kafka-python and librdkafka may create multiple connection attempts during initialization
+- Each connection attempt may register as a new member if not handled correctly
+- This is due to our implementation not correctly managing the consumer group protocol
+- We need to properly implement the state machine and member management
 
 ### Testing Tips
 - kafka-python requires proper RecordBatch encoding
@@ -121,3 +119,5 @@ RUST_LOG=debug ./target/release/rustka
 ## Important Rules
 - **NEVER make git commits** - The user will ALWAYS make commits themselves when they decide
 - **NEVER hide test failures** - If something is wrong, tests must fail visibly
+- **NEVER assume client libraries (librdkafka, kafka-python, etc.) are doing something wrong** - These are mature, battle-tested implementations. If there's a compatibility issue, the error is CERTAINLY in Rustka's implementation
+- **NO "phantom connections" exist** - If multiple members are being created, it's because Rustka is not correctly implementing the consumer group protocol

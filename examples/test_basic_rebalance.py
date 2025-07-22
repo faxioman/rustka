@@ -3,7 +3,7 @@
 Basic test to verify that rebalancing works
 """
 import time
-from kafka import KafkaConsumer, KafkaProducer
+from confluent_kafka import Producer, Consumer, KafkaError
 import threading
 
 def test_rebalancing():
@@ -11,45 +11,71 @@ def test_rebalancing():
     group = 'test-rebalance-group'
     
     # Produce some messages first
-    producer = KafkaProducer(bootstrap_servers=['localhost:9092'])
+    producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
     for i in range(30):
-        producer.send(topic, f'msg-{i}'.encode(), partition=i % 3)
+        producer.produce(topic, f'msg-{i}'.encode(), partition=i % 3)
     producer.flush()
-    producer.close()
     print("Produced 30 messages across 3 partitions")
     
     consumed_by = {}
     
     def consumer_thread(consumer_id):
-        consumer = KafkaConsumer(
-            topic,
-            bootstrap_servers=['localhost:9092'],
-            group_id=group,
-            auto_offset_reset='earliest',
-            consumer_timeout_ms=5000
-        )
+        consumer = Consumer({
+            'bootstrap.servers': '127.0.0.1:9092',
+            'group.id': group,
+            'client.id': f'consumer-{consumer_id}',
+            'auto.offset.reset': 'earliest',
+        })
+        
+        consumer.subscribe([topic])
         
         # Get initial assignment
-        consumer.poll(timeout_ms=1000)
-        partitions = consumer.assignment()
-        print(f"Consumer {consumer_id} assigned partitions: {partitions}")
+        def on_assign(consumer, partitions):
+            parts = [p.partition for p in partitions]
+            print(f"Consumer {consumer_id} assigned partitions: {parts}")
+        
+        def on_revoke(consumer, partitions):
+            parts = [p.partition for p in partitions]
+            print(f"Consumer {consumer_id} revoked partitions: {parts}")
+        
+        consumer.subscribe([topic], on_assign=on_assign, on_revoke=on_revoke)
         
         # Consume messages
-        for message in consumer:
-            key = f"{message.partition}-{message.offset}"
-            consumed_by[key] = consumer_id
-            print(f"Consumer {consumer_id} got message from partition {message.partition}")
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            msg = consumer.poll(0.5)
+            if msg and not msg.error():
+                key = f"{msg.partition()}-{msg.offset()}"
+                consumed_by[key] = consumer_id
+                print(f"Consumer {consumer_id} got message from partition {msg.partition()}")
         
         consumer.close()
         print(f"Consumer {consumer_id} finished")
     
-    # Start 3 consumers
+    # Start consumers with better timing
     threads = []
-    for i in range(3):
-        t = threading.Thread(target=consumer_thread, args=(i,))
-        t.start()
-        threads.append(t)
-        time.sleep(1)  # Stagger starts
+    
+    # Start first consumer
+    print("\nStarting consumer 0...")
+    t = threading.Thread(target=consumer_thread, args=(0,))
+    t.start()
+    threads.append(t)
+    
+    # Wait only 200ms before starting second consumer (within debounce window)
+    time.sleep(0.2)
+    
+    print("Starting consumer 1...")
+    t = threading.Thread(target=consumer_thread, args=(1,))
+    t.start()
+    threads.append(t)
+    
+    # Wait another 200ms for third consumer
+    time.sleep(0.2)
+    
+    print("Starting consumer 2...")
+    t = threading.Thread(target=consumer_thread, args=(2,))
+    t.start()
+    threads.append(t)
     
     # Wait for all to finish
     for t in threads:

@@ -1,57 +1,67 @@
 #!/usr/bin/env python3
 """
-Test API version negotiation with Rustka
+Test API version negotiation with librdkafka
+librdkafka always auto-negotiates, so we just verify it works
 """
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer
 import time
-import logging
 
-
-print("Testing API version negotiation...")
-
-try:
-    # Try to connect without specifying API version
-    # This should trigger ApiVersions request
-    print("\n1. Creating producer WITHOUT api_version (should auto-negotiate)...")
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        request_timeout_ms=5000,
-        api_version_auto_timeout_ms=5000
-    )
+def test_auto_negotiation():
+    print("Testing API version negotiation...")
+    
+    # librdkafka ALWAYS auto-negotiates API versions
+    print("\n1. Creating producer (librdkafka auto-negotiates)...")
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
     print("✓ Producer created successfully with auto-negotiation")
     
     # Send a test message
     topic = f'negotiation-test-{int(time.time())}'
-    future = producer.send(topic, b'test message')
-    result = future.get(timeout=5)
-    print(f"✓ Message sent successfully to {topic}")
+    delivered = False
     
-    producer.close()
+    def delivery_report(err, msg):
+        nonlocal delivered
+        if err is None:
+            delivered = True
     
-except KafkaError as e:
-    print(f"✗ Failed with error: {type(e).__name__}: {e}")
-    print("\nTrying with explicit API version...")
+    producer.produce(topic, b'test message', callback=delivery_report)
+    producer.flush(timeout=5)
     
-    # Fallback to explicit version
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(0, 10, 0)
-    )
-    print("✓ Producer created with explicit api_version=(0, 10, 0)")
-    producer.close()
-
-print("\n2. Testing consumer auto-negotiation...")
-try:
-    consumer = KafkaConsumer(
-        'test-topic',
-        bootstrap_servers=['localhost:9092'],
-        group_id='test-negotiation',
-        request_timeout_ms=30000,  # Increased to be larger than session timeout
-        session_timeout_ms=10000,  # Explicit session timeout
-        api_version_auto_timeout_ms=5000
-    )
+    if delivered:
+        print(f"✓ Message sent successfully to {topic}")
+    else:
+        print("✗ Failed to deliver message")
+        return False
+    
+    # Test consumer
+    print("\n2. Creating consumer (librdkafka auto-negotiates)...")
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'test-negotiation-{int(time.time())}',
+        'auto.offset.reset': 'earliest',
+    })
     print("✓ Consumer created successfully with auto-negotiation")
+    
+    consumer.subscribe([topic])
+    
+    # Consume the message
+    start_time = time.time()
+    consumed = False
+    while time.time() - start_time < 2:
+        msg = consumer.poll(0.1)
+        if msg and not msg.error():
+            print(f"✓ Consumed message: {msg.value().decode('utf-8')}")
+            consumed = True
+            break
+    
     consumer.close()
-except KafkaError as e:
-    print(f"✗ Consumer failed: {type(e).__name__}: {e}")
+    
+    return delivered and consumed
+
+if __name__ == "__main__":
+    if test_auto_negotiation():
+        print("\n✓ API negotiation test passed")
+    else:
+        print("\n✗ API negotiation test failed")
+        exit(1)

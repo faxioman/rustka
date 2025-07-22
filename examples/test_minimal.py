@@ -2,7 +2,7 @@
 """
 Minimal test for debugging
 """
-from kafka import KafkaProducer
+from confluent_kafka import Producer
 import logging
 
 logging.basicConfig(
@@ -13,21 +13,23 @@ logging.basicConfig(
 print("Creating producer with debug logging...")
 
 try:
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        api_version=(0, 10, 0),
-        request_timeout_ms=5000,
-        connections_max_idle_ms=5000
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'debug': 'broker,topic,msg',  # Enable debug logging
+    })
     
     print("\nProducer created! Sending message...")
     
-    future = producer.send('test', b'hello')
-    result = future.get(timeout=5)
+    def delivery_report(err, msg):
+        if err is not None:
+            print(f"Message delivery failed: {err}")
+        else:
+            print(f"\nSuccess! Message sent to partition {msg.partition()} offset {msg.offset()}")
     
-    print(f"\nSuccess! Message sent to partition {result.partition} offset {result.offset}")
+    producer.produce('test', b'hello', callback=delivery_report)
     
-    producer.close()
+    # Wait for delivery
+    producer.flush(timeout=5)
     
 except Exception as e:
     print(f"\nError: {e}")

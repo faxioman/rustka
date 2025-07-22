@@ -2,47 +2,56 @@
 """
 Test with modern API version to see if throughput improves
 """
-from kafka import KafkaProducer, KafkaConsumer
+from confluent_kafka import Producer, Consumer, KafkaError
 import time
 import json
 
-# Test different API versions
-api_versions = [
-    (0, 10, 0),  # Legacy - Fetch v3
-    (0, 11, 0),  # Should use Fetch v4+
-    (2, 0, 0),   # Modern
-]
+# librdkafka automatically negotiates the best API version
+# so we'll test throughput directly
 
 topic = f'api-test-{int(time.time())}'
 
+# Skip topic creation - let Rustka auto-create it
+# This avoids potential issues with AdminClient
+
 # Produce 50 messages
-producer = KafkaProducer(
-    bootstrap_servers=['localhost:9092'],
-    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-    api_version=(0, 10, 0)  # Use a known working version
-)
+producer = Producer({
+    'bootstrap.servers': '127.0.0.1:9092',
+})
+
+delivered = 0
+def delivery_report(err, msg):
+    global delivered
+    if err is None:
+        delivered += 1
 
 for i in range(50):
-    producer.send(topic, value={'id': i})
+    producer.produce(topic, value=json.dumps({'id': i}).encode('utf-8'), callback=delivery_report)
 
 producer.flush()
-producer.close()
-print("✓ Produced 50 messages")
+print(f"✓ Produced {delivered} messages")
 
-# Test each API version
-for idx, api_version in enumerate(api_versions):
-    print(f"\n--- Testing API version {api_version} ---")
+# Test different consumer configurations
+configs = [
+    {'name': 'Default config', 'config': {}},
+    {'name': 'Large batch', 'config': {'fetch.max.bytes': 52428800}},  # 50MB
+    {'name': 'Small timeout', 'config': {'fetch.wait.max.ms': 100}},
+]
+
+for idx, test_config in enumerate(configs):
+    print(f"\n--- Testing {test_config['name']} ---")
     
-    # Use different group ID and add small delay between tests
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        group_id=f'test-{int(time.time())}-{idx}-{api_version[0]}-{api_version[1]}',
-        auto_offset_reset='earliest',
-        api_version=api_version,
-        consumer_timeout_ms=2000,
-        max_poll_records=100
-    )
+    # Base consumer config
+    config = {
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'test-{int(time.time())}-{idx}',
+        'auto.offset.reset': 'earliest',
+    }
+    # Add test-specific config
+    config.update(test_config['config'])
+    
+    consumer = Consumer(config)
+    consumer.subscribe([topic])
     
     start_time = time.time()
     consumed = 0
@@ -50,9 +59,15 @@ for idx, api_version in enumerate(api_versions):
     
     while consumed < 50 and time.time() - start_time < 5:
         polls += 1
-        messages = consumer.poll(timeout_ms=100)
-        for tp, records in messages.items():
-            consumed += len(records)
+        msg = consumer.poll(0.1)
+        
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+        else:
+            consumed += 1
     
     elapsed = time.time() - start_time
     rate = consumed / elapsed if elapsed > 0 else 0
@@ -63,3 +78,5 @@ for idx, api_version in enumerate(api_versions):
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Polls: {polls}")
     print(f"  Rate: {rate:.1f} msg/sec")
+
+print("\n✓ librdkafka automatically negotiates optimal API versions")

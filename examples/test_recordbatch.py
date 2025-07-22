@@ -3,8 +3,7 @@
 Test to debug RecordBatch format issues
 """
 import sys
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer, KafkaError
 import json
 import time
 
@@ -12,45 +11,67 @@ def test_single_fetch():
     """Test fetching a single record"""
     print("1. Producing a single test record...")
     
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        api_version=(0, 10, 0)
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
     
     topic = f'test-{int(time.time())}'
-    test_value = {'test': 'message', 'id': 1}
     
-    future = producer.send(topic, value=test_value)
-    try:
-        record_metadata = future.get(timeout=10)
-        print(f"✓ Produced to topic={record_metadata.topic}, partition={record_metadata.partition}, offset={record_metadata.offset}")
-    except KafkaError as e:
-        print(f"✗ Failed to produce: {e}")
+    # Skip topic creation - let Rustka auto-create it
+    # This avoids potential issues with AdminClient
+    
+    test_value = json.dumps({'test': 'message', 'id': 1})
+    
+    delivered = False
+    partition = None
+    offset = None
+    
+    def delivery_report(err, msg):
+        nonlocal delivered, partition, offset
+        if err is None:
+            delivered = True
+            partition = msg.partition()
+            offset = msg.offset()
+    
+    producer.produce(topic, value=test_value.encode('utf-8'), callback=delivery_report)
+    producer.flush(timeout=5)  # 5 second timeout
+    
+    if delivered:
+        print(f"✓ Produced to topic={topic}, partition={partition}, offset={offset}")
+    else:
+        print(f"✗ Failed to produce")
         return False
-    
-    producer.close()
     
     print("\n2. Fetching the record...")
     
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        enable_auto_commit=False,
-        group_id=f'test-group-{int(time.time())}',
-        consumer_timeout_ms=5000,
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
-        api_version=(0, 10, 0)
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': False,
+        'group.id': f'test-group-{int(time.time())}',
+    })
+    
+    consumer.subscribe([topic])
     
     messages_found = 0
+    start_time = time.time()
     try:
-        for message in consumer:
-            print(f"✓ Received: topic={message.topic}, partition={message.partition}, offset={message.offset}, value={message.value}")
-            messages_found += 1
-            if messages_found >= 1:
-                break
+        while time.time() - start_time < 5:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(f"✗ Consumer error: {msg.error()}")
+                    return False
+            else:
+                value = json.loads(msg.value().decode('utf-8'))
+                print(f"✓ Received: topic={msg.topic()}, partition={msg.partition()}, offset={msg.offset()}, value={value}")
+                messages_found += 1
+                if messages_found >= 1:
+                    break
     except Exception as e:
         print(f"✗ Error consuming: {e}")
         import traceback
@@ -67,22 +88,31 @@ def test_empty_topic():
     
     topic = f'empty-test-{int(time.time())}'
     
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        enable_auto_commit=False,
-        group_id=f'test-group-{int(time.time())}',
-        consumer_timeout_ms=2000,
-        value_deserializer=lambda m: json.loads(m.decode('utf-8')) if m else None,
-        api_version=(0, 10, 0)
-    )
+    # Skip topic creation - let Rustka auto-create it
+    # This avoids potential issues with AdminClient
+    
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': False,
+        'group.id': f'test-group-{int(time.time())}',
+    })
+    
+    consumer.subscribe([topic])
     
     try:
-        messages = consumer.poll(timeout_ms=1000, max_records=10)
-        print(f"✓ Poll returned: {len(messages)} topic partitions")
-        for tp, records in messages.items():
-            print(f"  - {tp}: {len(records)} records")
+        # Poll a few times
+        for i in range(3):
+            msg = consumer.poll(0.5)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    # This is expected for empty topic
+                    print("✓ Got expected PARTITION_EOF for empty topic")
+                    return True
+        print("✓ No messages in empty topic (as expected)")
+        return True
     except Exception as e:
         print(f"✗ Error polling empty topic: {e}")
         import traceback
@@ -90,54 +120,63 @@ def test_empty_topic():
         return False
     finally:
         consumer.close()
-    
-    return True
 
 def test_batch_fetch():
     """Test fetching multiple records"""
     print("\n4. Testing batch fetch...")
     
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        api_version=(0, 10, 0)
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
     
     topic = f'batch-test-{int(time.time())}'
     
+    # Skip topic creation - let Rustka auto-create it
+    # This avoids potential issues with AdminClient
+    
     # Produce 5 records
+    delivered = 0
+    def delivery_report(err, msg):
+        nonlocal delivered
+        if err is None:
+            delivered += 1
+    
     for i in range(5):
-        producer.send(topic, value={'id': i, 'data': f'message-{i}'})
+        producer.produce(topic, value=json.dumps({'id': i, 'data': f'message-{i}'}).encode('utf-8'), callback=delivery_report)
     
     producer.flush()
-    producer.close()
+    print(f"✓ Produced {delivered} records")
     
-    print("✓ Produced 5 records")
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': False,
+        'group.id': f'test-group-{int(time.time())}',
+    })
     
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        enable_auto_commit=False,
-        group_id=f'test-group-{int(time.time())}',
-        consumer_timeout_ms=5000,
-        max_poll_records=10,
-        api_version=(0, 10, 0)
-    )
+    consumer.subscribe([topic])
     
     try:
-        messages = consumer.poll(timeout_ms=2000, max_records=10)
         total_records = 0
-        for tp, records in messages.items():
-            print(f"  - {tp}: {len(records)} records")
-            for record in records:
+        start_time = time.time()
+        while time.time() - start_time < 5 and total_records < 5:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(f"✗ Consumer error: {msg.error()}")
+                    return False
+            else:
                 try:
-                    value = json.loads(record.value.decode('utf-8'))
-                    print(f"    Record offset={record.offset}, value={value}")
+                    value = json.loads(msg.value().decode('utf-8'))
+                    print(f"    Record offset={msg.offset()}, value={value}")
                     total_records += 1
                 except Exception as e:
-                    print(f"    ✗ Failed to decode record at offset {record.offset}: {e}")
-                    print(f"      Raw bytes: {record.value[:50]}...")
+                    print(f"    ✗ Failed to decode record at offset {msg.offset()}: {e}")
+                    print(f"      Raw bytes: {msg.value()[:50]}...")
                     return False
         
         print(f"✓ Successfully fetched {total_records} records")

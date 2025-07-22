@@ -2,10 +2,26 @@
 """
 Test that verifies __commit_log messages are compatible with Snuba's expectations
 """
-from kafka import KafkaProducer, KafkaConsumer
+from confluent_kafka import Producer, Consumer, KafkaError
+from confluent_kafka.admin import AdminClient, NewTopic
 import time
 import json
 import struct
+
+def ensure_topic(topic_name):
+    """Ensure topic exists"""
+    admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
+    
+    try:
+        new_topic = NewTopic(topic_name, num_partitions=1, replication_factor=1)
+        fs = admin.create_topics([new_topic])
+        for topic, f in fs.items():
+            try:
+                f.result()
+            except Exception as e:
+                pass  # Topic might already exist
+    except Exception as e:
+        pass
 
 def parse_commit_log_key(key_bytes):
     """Parse the commit log key format"""
@@ -83,73 +99,95 @@ def test_snuba_compatibility():
     group_id = f'snuba-test-{int(time.time())}'
     topic = 'test-events'
     
+    # Ensure topic exists
+    ensure_topic(topic)
+    
     # Produce some messages
-    producer = KafkaProducer(
-        bootstrap_servers=['localhost:9092'],
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
-    )
+    producer = Producer({
+        'bootstrap.servers': '127.0.0.1:9092',
+    })
+    
+    delivered = 0
+    def delivery_report(err, msg):
+        nonlocal delivered
+        if err is None:
+            delivered += 1
     
     for i in range(5):
-        producer.send(topic, value={'event_id': i, 'data': f'event-{i}'})
+        producer.produce(topic, value=json.dumps({'event_id': i, 'data': f'event-{i}'}).encode('utf-8'), callback=delivery_report)
     producer.flush()
-    producer.close()
-    print(f"✓ Produced 5 messages to {topic}")
+    print(f"✓ Produced {delivered} messages to {topic}")
     
     # Create consumer and commit offsets
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=['localhost:9092'],
-        group_id=group_id,
-        auto_offset_reset='earliest',
-        enable_auto_commit=False,
-        consumer_timeout_ms=1000
-    )
+    consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': group_id,
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': False,
+    })
+    
+    consumer.subscribe([topic])
     
     consumed_count = 0
-    for msg in consumer:
-        consumed_count += 1
-        if consumed_count >= 5:
-            break
+    start_time = time.time()
+    while consumed_count < 5 and time.time() - start_time < 5:
+        msg = consumer.poll(1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+        else:
+            consumed_count += 1
     
     # Commit the offset
     consumer.commit()
     consumer.close()
-    print(f"✓ Consumed and committed offsets for group {group_id}")
+    print(f"✓ Consumed {consumed_count} and committed offsets for group {group_id}")
     
     # Now read from __commit_log and verify format
-    commit_log_consumer = KafkaConsumer(
-        '__commit_log',
-        bootstrap_servers=['localhost:9092'],
-        auto_offset_reset='earliest',
-        consumer_timeout_ms=2000
-    )
+    commit_log_consumer = Consumer({
+        'bootstrap.servers': '127.0.0.1:9092',
+        'group.id': f'commit-log-reader-{int(time.time())}',
+        'auto.offset.reset': 'earliest',
+    })
+    
+    commit_log_consumer.subscribe(['__commit_log'])
     
     found_commits = 0
     valid_format = True
     
-    for message in commit_log_consumer:
-        if message.key:
-            key_data = parse_commit_log_key(message.key)
-            if key_data and key_data.get('group_id') == group_id:
-                found_commits += 1
-                print(f"\n✓ Found commit for our group:")
-                print(f"  Key parsed: {key_data}")
-                
-                value_data = parse_commit_log_value(message.value)
-                if value_data:
-                    print(f"  Value parsed: {value_data}")
+    start_time = time.time()
+    while time.time() - start_time < 5:
+        msg = commit_log_consumer.poll(1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+        else:
+            if msg.key():
+                key_data = parse_commit_log_key(msg.key())
+                if key_data and key_data.get('group_id') == group_id:
+                    found_commits += 1
+                    print(f"\n✓ Found commit for our group:")
+                    print(f"  Key parsed: {key_data}")
                     
-                    # Verify the format matches Snuba's expectations
-                    if key_data['version'] != 1 or value_data['version'] != 1:
-                        print(f"  ✗ Version mismatch: key_v={key_data['version']}, value_v={value_data['version']}")
+                    value_data = parse_commit_log_value(msg.value())
+                    if value_data:
+                        print(f"  Value parsed: {value_data}")
+                        
+                        # Verify the format matches Snuba's expectations
+                        if key_data['version'] != 1 or value_data['version'] != 1:
+                            print(f"  ✗ Version mismatch: key_v={key_data['version']}, value_v={value_data['version']}")
+                            valid_format = False
+                        
+                        if value_data['offset'] < 0:
+                            print(f"  ✗ Invalid offset: {value_data['offset']}")
+                            valid_format = False
+                    else:
+                        print(f"  ✗ Could not parse value")
                         valid_format = False
-                    
-                    if value_data['offset'] < 0:
-                        print(f"  ✗ Invalid offset: {value_data['offset']}")
-                        valid_format = False
-                else:
-                    print(f"  ✗ Could not parse value")
-                    valid_format = False
     
     commit_log_consumer.close()
     

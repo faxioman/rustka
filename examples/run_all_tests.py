@@ -92,7 +92,7 @@ def main():
     print(f"Running {len(TEST_ORDER)} tests...")
     print(f"Python: {sys.executable}")
     
-    print("\n⚠️  Make sure the Rustka broker is running on localhost:9092")
+    print("\n⚠️  Make sure the Rustka broker is running on 127.0.0.1:9092")
     print("   Run 'cargo run --release' in another terminal\n")
     
     passed = 0

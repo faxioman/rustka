@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Simple test client for Rustka using kafka-python
+Simple test client for Rustka using librdkafka
 """
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
+from confluent_kafka import Producer, Consumer, KafkaError
 import json
 import time
 
 def test_rustka():
     print("Testing Rustka broker...")
     
-    # Test 1: Metadata
+    # Test 1: Metadata & Produce
     try:
-        producer = KafkaProducer(
-            bootstrap_servers=['localhost:9092'],
-            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            request_timeout_ms=5000,
-            api_version=(0, 10, 0)  # Use a compatible version
-        )
+        producer = Producer({
+            'bootstrap.servers': '127.0.0.1:9092',
+        })
         print("✓ Connected to broker")
     except Exception as e:
         print(f"✗ Failed to connect: {e}")
@@ -25,28 +21,54 @@ def test_rustka():
     
     # Test 2: Produce
     try:
-        future = producer.send('test-topic', {'message': 'Hello Rustka!'})
-        result = future.get(timeout=10)
-        print(f"✓ Produced message to partition {result.partition} at offset {result.offset}")
-    except KafkaError as e:
+        delivered = False
+        partition = None
+        offset = None
+        
+        def delivery_report(err, msg):
+            nonlocal delivered, partition, offset
+            if err is not None:
+                print(f"✗ Failed to produce: {err}")
+            else:
+                delivered = True
+                partition = msg.partition()
+                offset = msg.offset()
+        
+        value = json.dumps({'message': 'Hello Rustka!'}).encode('utf-8')
+        producer.produce('test-topic', value, callback=delivery_report)
+        producer.flush(timeout=10)
+        
+        if delivered:
+            print(f"✓ Produced message to partition {partition} at offset {offset}")
+    except Exception as e:
         print(f"✗ Failed to produce: {e}")
-    
-    producer.close()
     
     # Test 3: Consume
     try:
-        consumer = KafkaConsumer(
-            'test-topic',
-            bootstrap_servers=['localhost:9092'],
-            auto_offset_reset='earliest',
-            enable_auto_commit=False,
-            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-            consumer_timeout_ms=2000,
-            api_version=(0, 10, 0)
-        )
+        consumer = Consumer({
+            'bootstrap.servers': '127.0.0.1:9092',
+            'group.id': 'test-client-group',
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': False,
+        })
         
-        for message in consumer:
-            print(f"✓ Consumed message: {message.value} from partition {message.partition} offset {message.offset}")
+        consumer.subscribe(['test-topic'])
+        
+        # Poll for messages
+        start_time = time.time()
+        while time.time() - start_time < 2:
+            msg = consumer.poll(0.1)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(f"✗ Consumer error: {msg.error()}")
+                    break
+            
+            value = json.loads(msg.value().decode('utf-8'))
+            print(f"✓ Consumed message: {value} from partition {msg.partition()} offset {msg.offset()}")
             break
         
         consumer.close()
