@@ -10,14 +10,8 @@ def test_rebalancing():
     topic = 'test-rebalance'
     group = 'test-rebalance-group'
     
-    # Produce some messages first
-    producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
-    for i in range(30):
-        producer.produce(topic, f'msg-{i}'.encode(), partition=i % 3)
-    producer.flush()
-    print("Produced 30 messages across 3 partitions")
-    
     consumed_by = {}
+    consumer_ready = [False, False, False]
     
     def consumer_thread(consumer_id):
         consumer = Consumer({
@@ -33,6 +27,7 @@ def test_rebalancing():
         def on_assign(consumer, partitions):
             parts = [p.partition for p in partitions]
             print(f"Consumer {consumer_id} assigned partitions: {parts}")
+            consumer_ready[consumer_id] = True
         
         def on_revoke(consumer, partitions):
             parts = [p.partition for p in partitions]
@@ -52,32 +47,34 @@ def test_rebalancing():
         consumer.close()
         print(f"Consumer {consumer_id} finished")
     
-    # Start consumers with better timing
+    # Start all consumers first
     threads = []
     
-    # Start first consumer
-    print("\nStarting consumer 0...")
-    t = threading.Thread(target=consumer_thread, args=(0,))
-    t.start()
-    threads.append(t)
+    print("\nStarting all consumers...")
+    for i in range(3):
+        print(f"Starting consumer {i}...")
+        t = threading.Thread(target=consumer_thread, args=(i,))
+        t.start()
+        threads.append(t)
+        time.sleep(0.1)  # Small delay between starts
     
-    # Wait only 200ms before starting second consumer (within debounce window)
-    time.sleep(0.2)
+    # Wait for all consumers to be ready (assigned partitions)
+    print("\nWaiting for all consumers to be ready...")
+    for i in range(30):  # Max 3 seconds
+        if all(consumer_ready):
+            print("All consumers ready!")
+            break
+        time.sleep(0.1)
     
-    print("Starting consumer 1...")
-    t = threading.Thread(target=consumer_thread, args=(1,))
-    t.start()
-    threads.append(t)
+    # Now produce messages after all consumers are ready
+    print("\nProducing messages...")
+    producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
+    for i in range(30):
+        producer.produce(topic, f'msg-{i}'.encode(), partition=i % 3)
+    producer.flush()
+    print("Produced 30 messages across 3 partitions")
     
-    # Wait another 200ms for third consumer
-    time.sleep(0.2)
-    
-    print("Starting consumer 2...")
-    t = threading.Thread(target=consumer_thread, args=(2,))
-    t.start()
-    threads.append(t)
-    
-    # Wait for all to finish
+    # Wait for all to finish consuming
     for t in threads:
         t.join()
     
