@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use std::env;
 use local_ip_address::local_ip;
 
@@ -295,7 +295,7 @@ fn parse_record_batch(data: &Bytes) -> Vec<(Option<Bytes>, Bytes, IndexMap<StrBy
         Ok(record_set) => {
             debug!("Decoded RecordBatch with {} records", record_set.records.len());
             
-            for record in record_set.records {
+            for (idx, record) in record_set.records.into_iter().enumerate() {
                 let key = record.key.map(|k| Bytes::copy_from_slice(&k));
                 let value = record.value.unwrap_or(Bytes::new());
                 let value_copy = if value.is_empty() {
@@ -304,8 +304,10 @@ fn parse_record_batch(data: &Bytes) -> Vec<(Option<Bytes>, Bytes, IndexMap<StrBy
                     Bytes::copy_from_slice(&value)
                 };
                 
+                debug!("Record {}: headers count = {}", idx, record.headers.len());
                 let mut headers_copy = IndexMap::new();
                 for (k, v) in record.headers {
+                    debug!("  Header: key='{}', value={:?}", k.as_str(), v.as_ref().map(|b| b.len()));
                     let v_copy = v.map(|val| Bytes::copy_from_slice(&val));
                     headers_copy.insert(k, v_copy);
                 }
@@ -437,8 +439,8 @@ async fn handle_api_versions(
     let supported_apis = vec![
         (18, 0, 4),  // ApiVersions
         (3, 0, 2),   // Metadata
-        (0, 0, 2),   // Produce
-        (1, 0, 3),   // Fetch
+        (0, 0, 3),   // Produce - v3 introduced headers
+        (1, 0, 11),  // Fetch - support up to v11 for headers
         (2, 0, 1),   // ListOffsets
         (10, 0, 1),  // FindCoordinator
         (11, 0, 2),  // JoinGroup
@@ -620,23 +622,28 @@ async fn handle_produce(
                 let preview = &records.as_ref()[..std::cmp::min(100, records.len())];
                 debug!("Records preview (first {} bytes): {:?}", preview.len(), preview);
                 
+                // Check magic byte to determine format
+                let magic_byte = if records.len() >= 17 { records.as_ref()[16] } else { 0 };
+                debug!("Produce API v{}, magic byte: {}", header.request_api_version, magic_byte);
+                
                 let mut base_offset = 0i64;
                 let message_count: u64;
                 
-                if header.request_api_version >= 3 {
-                    let batch_messages = parse_record_batch(&records);
-                    if !batch_messages.is_empty() {
-                        debug!("Extracted {} messages from RecordBatch", batch_messages.len());
-                        message_count = batch_messages.len() as u64;
-                        for (i, (key, value, headers)) in batch_messages.into_iter().enumerate() {
-                            let headers_count = headers.len();
-                            let offset = storage.append_records_with_headers(&topic_name, partition, key, value, headers);
-                            if i == 0 {
-                                base_offset = offset;
-                            }
-                            debug!("Stored message {} at offset {} with {} headers", i, offset, headers_count);
+                // Support RecordBatch (magic=2) even with API v2 (Kafka 0.11+)
+                // But also try to parse as RecordBatch first, regardless of magic byte
+                let batch_messages = parse_record_batch(&records);
+                if !batch_messages.is_empty() {
+                    debug!("Successfully extracted {} messages from RecordBatch", batch_messages.len());
+                    message_count = batch_messages.len() as u64;
+                    for (i, (key, value, headers)) in batch_messages.into_iter().enumerate() {
+                        let headers_count = headers.len();
+                        let offset = storage.append_records_with_headers(&topic_name, partition, key, value, headers);
+                        if i == 0 {
+                            base_offset = offset;
                         }
-                    } else {
+                        debug!("Stored message {} at offset {} with {} headers", i, offset, headers_count);
+                    }
+                } else {
                         let messages = parse_message_set(&records);
                         debug!("Extracted {} messages from MessageSet (fallback)", messages.len());
                         
@@ -659,30 +666,6 @@ async fn handle_produce(
                             partition_responses.push(partition_response);
                             continue;
                         }
-                    }
-                } else {
-                    let messages = parse_message_set(&records);
-                    debug!("Extracted {} messages from MessageSet", messages.len());
-                    
-                    if !messages.is_empty() {
-                        message_count = messages.len() as u64;
-                        for (i, (key, value)) in messages.into_iter().enumerate() {
-                            let offset = storage.append_records(&topic_name, partition, key, value);
-                            if i == 0 {
-                                base_offset = offset;
-                            }
-                            debug!("Stored message {} at offset {}", i, offset);
-                        }
-                    } else {
-                        error!("Failed to parse any messages from MessageSet for topic '{}' partition {}", topic_name, partition);
-                        // Don't store raw bytes, return error
-                        let mut partition_response = PartitionProduceResponse::default();
-                        partition_response.index = partition;
-                        partition_response.error_code = 2; // CORRUPT_MESSAGE
-                        partition_response.base_offset = -1;
-                        partition_responses.push(partition_response);
-                        continue;
-                    }
                 }
                 
                 debug!("Produced to topic={}, partition={}, base_offset={}", topic_name, partition, base_offset);
@@ -766,8 +749,13 @@ async fn handle_fetch(
                    topic_name, partition.partition, partition.fetch_offset, 
                    partition.partition_max_bytes);
             
-            let needs_record_batch = header.request_api_version >= 4 || 
-                storage.topic_has_headers(&topic_name, partition.partition);
+            let has_headers = storage.topic_has_headers(&topic_name, partition.partition);
+            // Use RecordBatch for API v2+ to support headers properly
+            // confluent-kafka often uses API v3 which needs RecordBatch for headers
+            let needs_record_batch = header.request_api_version >= 2;
+            
+            debug!("Fetch decision: api_version={}, has_headers={}, needs_record_batch={}", 
+                   header.request_api_version, has_headers, needs_record_batch);
             
             let (error_code, high_watermark, records_bytes) = if needs_record_batch {
                 let batch_result = storage.fetch_batch_recordbatch(

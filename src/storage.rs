@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
 use std::time::Instant;
 use std::collections::VecDeque;
+use tracing::debug;
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xffffffff;
@@ -100,6 +101,12 @@ impl InMemoryStorage {
         });
         
         let offset = partition_entry.next_offset;
+        
+        let headers_count = headers.len();
+        if headers_count > 0 {
+            debug!("Storing record at offset {} with {} headers for topic={}, partition={}", 
+                   offset, headers_count, topic, partition);
+        }
         
         partition_entry.records.push_back(Record { 
             key, 
@@ -291,6 +298,7 @@ impl InMemoryStorage {
             
             let stored_record = &partition_data.records[record_index];
             
+            let headers_count = stored_record.headers.len();
             let record = KafkaRecord {
                 transactional: false,
                 control: false,
@@ -305,6 +313,10 @@ impl InMemoryStorage {
                 value: Some(stored_record.value.clone()),
                 headers: stored_record.headers.clone(),
             };
+            
+            if headers_count > 0 {
+                debug!("Creating RecordBatch record at offset {} with {} headers", current_offset, headers_count);
+            }
             
             // Estimate size (rough approximation)
             estimated_size += 50; // Base overhead
