@@ -119,5 +119,6 @@ RUST_LOG=debug ./target/release/rustka
 ## Important Rules
 - **NEVER make git commits** - The user will ALWAYS make commits themselves when they decide
 - **NEVER hide test failures** - If something is wrong, tests must fail visibly
-- **NEVER assume client libraries (librdkafka, kafka-python, etc.) are doing something wrong** - These are mature, battle-tested implementations. If there's a compatibility issue, the error is CERTAINLY in Rustka's implementation
+- **NEVER assume client libraries (librdkafka, kafka-python, confluent-kafka, etc.) are doing something wrong** - These are mature, battle-tested implementations. If there's a compatibility issue, the error is CERTAINLY in Rustka's implementation
 - **NO "phantom connections" exist** - If multiple members are being created, it's because Rustka is not correctly implementing the consumer group protocol
+- **IF SOMETHING WORKS ON REDPANDA BUT NOT ON RUSTKA, IT'S ALWAYS A BUG IN RUSTKA** - NEVER blame the client, NEVER make excuses. If Redpanda handles it correctly, Rustka MUST handle it correctly too. THE BUG IS ALWAYS IN RUSTKA.
