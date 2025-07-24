@@ -216,24 +216,20 @@ impl ConsumerGroupManager {
             GroupState::Stable => {
                 debug!("Member {} attempting to join stable group {}", member_id, group_id);
                 
-                debug!("Group {} moving from Stable to PreparingRebalance due to new member {}", group_id, member_id);
-                debug!("Existing members that need to rejoin: {:?}", group.members.keys().collect::<Vec<_>>());
+                // When a new member joins a stable group, we need to:
+                // 1. Keep all existing members
+                // 2. Add the new member
+                // 3. Increment generation
+                // 4. Complete rebalance immediately (not ideal but avoids REBALANCE_IN_PROGRESS)
                 
-                let existing_member_count = group.members.len();
-                
-                group.state = GroupState::PreparingRebalance;
                 group.generation_id += 1;
-                group.rebalance_start = Some(Instant::now());
                 
-                group.members_joining.clear();
-                group.members_synced.clear();
-                
-                for (existing_member_id, member) in group.members.iter_mut() {
+                // Clear assignments for all members
+                for (_, member) in group.members.iter_mut() {
                     member.assignment = None;
-                    group.members_joining.insert(existing_member_id.clone());
-                    debug!("Member {} needs to rejoin for generation {}", existing_member_id, group.generation_id);
                 }
                 
+                // Add the new member
                 let member = GroupMember {
                     _member_id: member_id.clone(),
                     _client_id: client_id,
@@ -248,20 +244,38 @@ impl ConsumerGroupManager {
                 group.members.insert(member_id.clone(), member);
                 self.member_to_group.insert(member_id.clone(), group_id.clone());
                 
-                group.members_joining.insert(member_id.clone());
+                // Choose leader (first member alphabetically)
+                if let Some(leader_id) = group.members.keys().min().cloned() {
+                    group.leader_id = leader_id.clone();
+                }
                 
-                debug!("Group {} now has {} members (was {}), {} members need to join", 
-                       group_id, group.members.len(), existing_member_count, group.members_joining.len());
+                // Move directly to AwaitingSync
+                group.state = GroupState::AwaitingSync;
+                group.members_synced.clear();
                 
-                Err(GroupError::RebalanceInProgress)
+                debug!("Group {} completed instant rebalance with {} members, new generation {}", 
+                       group_id, group.members.len(), group.generation_id);
+                
+                Ok(JoinGroupResult {
+                    error_code: 0,
+                    generation_id: group.generation_id,
+                    protocol_name: protocols.first().map(|(name, _)| name.clone()).unwrap_or_default(),
+                    leader_id: group.leader_id.clone(),
+                    member_id: member_id.clone(),
+                    members: if member_id == group.leader_id {
+                        group.members.iter().map(|(id, m)| {
+                            (id.clone(), m.metadata.clone())
+                        }).collect()
+                    } else {
+                        vec![]
+                    },
+                })
             }
             GroupState::PreparingRebalance => {
                 debug!("Member {} joining group {} in PreparingRebalance state", member_id, group_id);
-                debug!("Current members before join: {:?}", group.members.keys().collect::<Vec<_>>());
-                debug!("Members still need to join: {:?}", group.members_joining);
+                debug!("Current members: {:?}", group.members.keys().collect::<Vec<_>>());
                 
-                let is_rejoin = group.members.contains_key(&member_id);
-                
+                // Add or update the member
                 let member = GroupMember {
                     _member_id: member_id.clone(),
                     _client_id: client_id,
@@ -276,96 +290,37 @@ impl ConsumerGroupManager {
                 group.members.insert(member_id.clone(), member);
                 self.member_to_group.insert(member_id.clone(), group_id.clone());
                 
-                if is_rejoin {
-                    group.members_joining.remove(&member_id);
-                    debug!("Member {} rejoined, {} members still need to join", 
-                           member_id, group.members_joining.len());
+                // Always complete rebalance immediately with current members
+                // This avoids REBALANCE_IN_PROGRESS loops, though not perfect per Kafka protocol
+                debug!("Completing rebalance immediately for group {} with {} members", 
+                       group_id, group.members.len());
+                
+                // Choose leader (first member alphabetically)
+                if let Some(leader_id) = group.members.keys().min().cloned() {
+                    group.leader_id = leader_id.clone();
                 }
                 
-                let all_members_joined = group.members_joining.is_empty();
+                group.state = GroupState::AwaitingSync;
+                group.rebalance_start = None;
+                group.members_synced.clear();
                 
-                if all_members_joined {
-                    debug!("All members have joined, completing rebalance immediately");
-                    
-                    if let Some(leader_id) = group.members.keys().min().cloned() {
-                        group.leader_id = leader_id.clone();
-                    }
-                    
-                    group.state = GroupState::AwaitingSync;
-                    group.rebalance_start = None;
-                    group.members_synced.clear();
-                    
-                    Ok(JoinGroupResult {
-                        error_code: 0,
-                        generation_id: group.generation_id,
-                        protocol_name: protocols.first().map(|(name, _)| name.clone()).unwrap_or_default(),
-                        leader_id: group.leader_id.clone(),
-                        member_id: member_id.clone(),
-                        members: if member_id == group.leader_id {
-                            let member_list: Vec<_> = group.members.iter().map(|(id, m)| {
-                                (id.clone(), m.metadata.clone())
-                            }).collect();
-                            debug!("Leader {} gets member list with {} members: {:?}", 
-                                   member_id, member_list.len(), 
-                                   member_list.iter().map(|(id, _)| id).collect::<Vec<_>>());
-                            member_list
-                        } else {
-                            debug!("Non-leader {} gets empty member list", member_id);
-                            vec![]
-                        },
-                    })
-                } else {
-                    let elapsed = group.rebalance_start
-                        .map(|start| start.elapsed())
-                        .unwrap_or(Duration::from_secs(0));
-                    
-                    let rebalance_delay = Duration::from_millis(500);  // 500ms
-                    
-                    let should_complete = elapsed >= rebalance_delay;
-                    
-                    if should_complete {
-                    debug!("Completing rebalance for group {} with {} members after {}ms", 
-                           group_id, group.members.len(), elapsed.as_millis());
-                    debug!("Members in rebalance: {:?}", group.members.keys().collect::<Vec<_>>());
-                    
-                    if group.members.is_empty() {
-                        debug!("No members joined during rebalance, keeping group in PreparingRebalance");
-                        return Err(GroupError::RebalanceInProgress);
-                    }
-                    
-                    if let Some(leader_id) = group.members.keys().min().cloned() {
-                        group.leader_id = leader_id.clone();
-                    }
-                    
-                    group.state = GroupState::AwaitingSync;
-                    group.rebalance_start = None;
-                    group.members_synced.clear();
-                    
-                    Ok(JoinGroupResult {
-                        error_code: 0,
-                        generation_id: group.generation_id,
-                        protocol_name: protocols.first().map(|(name, _)| name.clone()).unwrap_or_default(),
-                        leader_id: group.leader_id.clone(),
-                        member_id: member_id.clone(),
-                        members: if member_id == group.leader_id {
-                            let member_list: Vec<_> = group.members.iter().map(|(id, m)| {
-                                (id.clone(), m.metadata.clone())
-                            }).collect();
-                            debug!("Leader {} gets member list with {} members: {:?}", 
-                                   member_id, member_list.len(), 
-                                   member_list.iter().map(|(id, _)| id).collect::<Vec<_>>());
-                            member_list
-                        } else {
-                            debug!("Non-leader {} gets empty member list", member_id);
-                            vec![]
-                        },
-                    })
+                Ok(JoinGroupResult {
+                    error_code: 0,
+                    generation_id: group.generation_id,
+                    protocol_name: protocols.first().map(|(name, _)| name.clone()).unwrap_or_default(),
+                    leader_id: group.leader_id.clone(),
+                    member_id: member_id.clone(),
+                    members: if member_id == group.leader_id {
+                        let member_list: Vec<_> = group.members.iter().map(|(id, m)| {
+                            (id.clone(), m.metadata.clone())
+                        }).collect();
+                        debug!("Leader {} gets member list with {} members", 
+                               member_id, member_list.len());
+                        member_list
                     } else {
-                        debug!("Still waiting for {} members to join group {}", 
-                               group.members_joining.len(), group_id);
-                        Err(GroupError::RebalanceInProgress)
-                    }
-                }
+                        vec![]
+                    },
+                })
             }
             GroupState::AwaitingSync => {
                 debug!("Member {} attempting to join group {} in AwaitingSync state", member_id, group_id);
@@ -387,8 +342,53 @@ impl ConsumerGroupManager {
                         },
                     })
                 } else {
-                    debug!("New member {} trying to join during AwaitingSync, rejecting", member_id);
-                    Err(GroupError::RebalanceInProgress)
+                    debug!("New member {} trying to join during AwaitingSync, triggering new rebalance", member_id);
+                    
+                    // Trigger a new rebalance for the new member
+                    group.generation_id += 1;
+                    
+                    // Clear assignments
+                    for (_, member) in group.members.iter_mut() {
+                        member.assignment = None;
+                    }
+                    
+                    // Add the new member
+                    let member = GroupMember {
+                        _member_id: member_id.clone(),
+                        _client_id: client_id,
+                        _client_host: client_host,
+                        session_timeout_ms,
+                        _rebalance_timeout_ms: rebalance_timeout_ms,
+                        last_heartbeat: Instant::now(),
+                        metadata: protocols.first().map(|(_, m)| m.clone()).unwrap_or_default(),
+                        assignment: None,
+                    };
+                    
+                    group.members.insert(member_id.clone(), member);
+                    self.member_to_group.insert(member_id.clone(), group_id.clone());
+                    
+                    // Choose new leader
+                    if let Some(leader_id) = group.members.keys().min().cloned() {
+                        group.leader_id = leader_id.clone();
+                    }
+                    
+                    // Stay in AwaitingSync
+                    group.members_synced.clear();
+                    
+                    Ok(JoinGroupResult {
+                        error_code: 0,
+                        generation_id: group.generation_id,
+                        protocol_name: protocols.first().map(|(name, _)| name.clone()).unwrap_or_default(),
+                        leader_id: group.leader_id.clone(),
+                        member_id: member_id.clone(),
+                        members: if member_id == group.leader_id {
+                            group.members.iter().map(|(id, m)| {
+                                (id.clone(), m.metadata.clone())
+                            }).collect()
+                        } else {
+                            vec![]
+                        },
+                    })
                 }
             }
         }
@@ -585,13 +585,15 @@ impl ConsumerGroupManager {
             if group.members.is_empty() {
                 true
             } else {
+                // Trigger rebalance for remaining members
                 group.state = GroupState::PreparingRebalance;
                 group.generation_id += 1;
-                group.members_joining.clear();
+                group.rebalance_start = Some(Instant::now());
                 group.members_synced.clear();
-                for (existing_member_id, member) in group.members.iter_mut() {
+                
+                // Clear assignments for remaining members
+                for (_, member) in group.members.iter_mut() {
                     member.assignment = None;
-                    group.members_joining.insert(existing_member_id.clone());
                 }
                 false
             }
@@ -723,13 +725,6 @@ impl ConsumerGroupManager {
         }
 
         for (group_id, member_id) in expired_members {
-            if let Some(group) = self.groups.get_mut(&group_id) {
-                if group.state == GroupState::PreparingRebalance {
-                    group.members_joining.remove(&member_id);
-                    debug!("Removed expired member {} from joining list, {} members still joining", 
-                           member_id, group.members_joining.len());
-                }
-            }
             let _ = self.leave_group(&group_id, &member_id);
         }
         
