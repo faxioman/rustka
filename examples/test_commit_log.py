@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
-"""
-Test that verifies commit log messages have proper keys
-"""
 from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 import time
 import json
 
 def ensure_topic(topic_name):
-    """Ensure topic exists"""
     admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     try:
-        # Try to create the topic
         topic = NewTopic(topic_name, num_partitions=1, replication_factor=1)
         fs = admin.create_topics([topic])
         for topic, f in fs.items():
             try:
-                f.result()  # The result itself is None
+                f.result()
             except Exception as e:
-                # Topic might already exist
                 pass
     except Exception as e:
         pass
@@ -29,8 +23,6 @@ def test_commit_log():
     
     group_id = f'test-commit-log-{int(time.time())}'
     topic = 'test-topic'
-    
-    # Ensure the topic exists
     ensure_topic(topic)
     
     consumer = Consumer({
@@ -41,11 +33,7 @@ def test_commit_log():
     })
     
     consumer.subscribe([topic])
-    
-    # Do an initial poll
     consumer.poll(timeout=0.1)
-    
-    # Produce a message
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
     })
@@ -62,8 +50,6 @@ def test_commit_log():
     if not delivered:
         print("✗ Failed to deliver message")
         return False
-    
-    # Consume the message
     consumed_offset = None
     start_time = time.time()
     while time.time() - start_time < 5:
@@ -84,12 +70,8 @@ def test_commit_log():
     if consumed_offset is None:
         print("✗ Failed to consume message")
         return False
-    
-    # Commit the offset
     consumer.commit()
     print(f"✓ Committed offsets for group {group_id}")
-    
-    # Now check the commit log
     commit_log_consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'commit-log-reader-{int(time.time())}',
@@ -132,7 +114,6 @@ def test_commit_log():
         return False
 
 if __name__ == "__main__":
-    # Wait a bit for Rustka to start
     time.sleep(1)
     
     success = test_commit_log()

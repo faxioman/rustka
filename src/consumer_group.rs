@@ -49,7 +49,6 @@ pub struct ConsumerGroupManager {
     next_member_id: i32,
     storage: Option<Arc<Mutex<crate::storage::InMemoryStorage>>>,
     metrics: Option<Arc<MetricsCollector>>,
-    // Configuration
     offset_retention_ms: u64,  // Default: 3600000 (1 hour)
     empty_group_retention_ms: u64,  // Default: 600000 (10 minutes)
 }
@@ -79,13 +78,11 @@ impl ConsumerGroupManager {
         self.metrics = Some(metrics);
     }
     
-    /// Set retention times for testing
     pub fn set_retention_times(&mut self, offset_retention_ms: u64, empty_group_retention_ms: u64) {
         self.offset_retention_ms = offset_retention_ms;
         self.empty_group_retention_ms = empty_group_retention_ms;
     }
     
-    /// Force cleanup of all empty groups and their offsets (for testing/admin)
     pub fn force_cleanup_empty_groups(&mut self) {
         let groups_to_remove: Vec<String> = self.groups.iter()
             .filter_map(|(group_id, group)| {
@@ -97,12 +94,10 @@ impl ConsumerGroupManager {
             })
             .collect();
         
-        // Remove all empty groups
         for group_id in &groups_to_remove {
             self.groups.remove(group_id);
         }
         
-        // Remove offsets for removed groups
         self.offsets.retain(|(g, _, _), _| {
             !groups_to_remove.contains(g)
         });
@@ -131,7 +126,6 @@ impl ConsumerGroupManager {
         let is_new_member = member_id.is_none() || member_id.as_ref().map_or(false, |id| id.is_empty());
         
         let member_id = if is_new_member {
-            // Check if this client already has a member_id in this group
             let client_key = (group_id.clone(), client_id.clone());
             if let Some(existing_member_id) = self.client_to_member.get(&client_key) {
                 debug!("Reusing existing member_id {} for client {}", existing_member_id, client_id);
@@ -166,7 +160,6 @@ impl ConsumerGroupManager {
 
         match group.state {
             GroupState::Empty => {
-                // First member joining - start rebalance immediately
                 debug!("First member {} joining empty group {}", member_id, group_id);
                 
                 group.state = GroupState::PreparingRebalance;
@@ -187,14 +180,12 @@ impl ConsumerGroupManager {
                 group.members.insert(member_id.clone(), member);
                 self.member_to_group.insert(member_id.clone(), group_id.clone());
                 
-                // For a single member, complete rebalance immediately
                 group.leader_id = member_id.clone();
                 group.state = GroupState::AwaitingSync;
                 group.rebalance_start = None;
                 group.members_joining.clear(); // No one else needs to join
                 group.members_synced.clear(); // Clear synced members for new sync phase
                 
-                // Update metrics
                 if let Some(metrics) = &self.metrics {
                     let runtime = tokio::runtime::Handle::try_current();
                     if let Ok(handle) = runtime {
@@ -213,7 +204,6 @@ impl ConsumerGroupManager {
                     }
                 }
                 
-                // Leader gets the full member list
                 Ok(JoinGroupResult {
                     error_code: 0,
                     generation_id: group.generation_id,
@@ -226,29 +216,24 @@ impl ConsumerGroupManager {
             GroupState::Stable => {
                 debug!("Member {} attempting to join stable group {}", member_id, group_id);
                 
-                // Trigger rebalance for any join during stable state
                 debug!("Group {} moving from Stable to PreparingRebalance due to new member {}", group_id, member_id);
                 debug!("Existing members that need to rejoin: {:?}", group.members.keys().collect::<Vec<_>>());
                 
-                // Record who was in the group before rebalance
                 let existing_member_count = group.members.len();
                 
                 group.state = GroupState::PreparingRebalance;
                 group.generation_id += 1;
                 group.rebalance_start = Some(Instant::now());
                 
-                // Clear joining members for new rebalance
                 group.members_joining.clear();
                 group.members_synced.clear();
                 
-                // All existing members need to rejoin
                 for (existing_member_id, member) in group.members.iter_mut() {
                     member.assignment = None;
                     group.members_joining.insert(existing_member_id.clone());
                     debug!("Member {} needs to rejoin for generation {}", existing_member_id, group.generation_id);
                 }
                 
-                // Add the new member
                 let member = GroupMember {
                     _member_id: member_id.clone(),
                     _client_id: client_id,
@@ -263,13 +248,11 @@ impl ConsumerGroupManager {
                 group.members.insert(member_id.clone(), member);
                 self.member_to_group.insert(member_id.clone(), group_id.clone());
                 
-                // This new member is also joining
                 group.members_joining.insert(member_id.clone());
                 
                 debug!("Group {} now has {} members (was {}), {} members need to join", 
                        group_id, group.members.len(), existing_member_count, group.members_joining.len());
                 
-                // Return REBALANCE_IN_PROGRESS to trigger client rejoin
                 Err(GroupError::RebalanceInProgress)
             }
             GroupState::PreparingRebalance => {
@@ -277,10 +260,8 @@ impl ConsumerGroupManager {
                 debug!("Current members before join: {:?}", group.members.keys().collect::<Vec<_>>());
                 debug!("Members still need to join: {:?}", group.members_joining);
                 
-                // Check if this is an existing member rejoining
                 let is_rejoin = group.members.contains_key(&member_id);
                 
-                // Add or update member
                 let member = GroupMember {
                     _member_id: member_id.clone(),
                     _client_id: client_id,
@@ -295,20 +276,17 @@ impl ConsumerGroupManager {
                 group.members.insert(member_id.clone(), member);
                 self.member_to_group.insert(member_id.clone(), group_id.clone());
                 
-                // If this is a rejoin, mark this member as having joined
                 if is_rejoin {
                     group.members_joining.remove(&member_id);
                     debug!("Member {} rejoined, {} members still need to join", 
                            member_id, group.members_joining.len());
                 }
                 
-                // Check if all members have joined
                 let all_members_joined = group.members_joining.is_empty();
                 
                 if all_members_joined {
                     debug!("All members have joined, completing rebalance immediately");
                     
-                    // Elect leader (first member by ID for determinism)
                     if let Some(leader_id) = group.members.keys().min().cloned() {
                         group.leader_id = leader_id.clone();
                     }
@@ -317,7 +295,6 @@ impl ConsumerGroupManager {
                     group.rebalance_start = None;
                     group.members_synced.clear();
                     
-                    // All members that made it into this rebalance get success
                     Ok(JoinGroupResult {
                         error_code: 0,
                         generation_id: group.generation_id,
@@ -325,7 +302,6 @@ impl ConsumerGroupManager {
                         leader_id: group.leader_id.clone(),
                         member_id: member_id.clone(),
                         members: if member_id == group.leader_id {
-                            // Only leader gets full member list per Kafka protocol
                             let member_list: Vec<_> = group.members.iter().map(|(id, m)| {
                                 (id.clone(), m.metadata.clone())
                             }).collect();
@@ -334,18 +310,15 @@ impl ConsumerGroupManager {
                                    member_list.iter().map(|(id, _)| id).collect::<Vec<_>>());
                             member_list
                         } else {
-                            // Non-leaders get empty list
                             debug!("Non-leader {} gets empty member list", member_id);
                             vec![]
                         },
                     })
                 } else {
-                    // Check if we should complete rebalance by timeout
                     let elapsed = group.rebalance_start
                         .map(|start| start.elapsed())
                         .unwrap_or(Duration::from_secs(0));
                     
-                    // Use shorter delay during active rebalancing
                     let rebalance_delay = Duration::from_millis(500);  // 500ms
                     
                     let should_complete = elapsed >= rebalance_delay;
@@ -355,13 +328,11 @@ impl ConsumerGroupManager {
                            group_id, group.members.len(), elapsed.as_millis());
                     debug!("Members in rebalance: {:?}", group.members.keys().collect::<Vec<_>>());
                     
-                    // Only complete if we have at least one member
                     if group.members.is_empty() {
                         debug!("No members joined during rebalance, keeping group in PreparingRebalance");
                         return Err(GroupError::RebalanceInProgress);
                     }
                     
-                    // Elect leader (first member by ID for determinism)
                     if let Some(leader_id) = group.members.keys().min().cloned() {
                         group.leader_id = leader_id.clone();
                     }
@@ -370,7 +341,6 @@ impl ConsumerGroupManager {
                     group.rebalance_start = None;
                     group.members_synced.clear();
                     
-                    // All members that made it into this rebalance get success
                     Ok(JoinGroupResult {
                         error_code: 0,
                         generation_id: group.generation_id,
@@ -378,7 +348,6 @@ impl ConsumerGroupManager {
                         leader_id: group.leader_id.clone(),
                         member_id: member_id.clone(),
                         members: if member_id == group.leader_id {
-                            // Only leader gets full member list per Kafka protocol
                             let member_list: Vec<_> = group.members.iter().map(|(id, m)| {
                                 (id.clone(), m.metadata.clone())
                             }).collect();
@@ -387,13 +356,11 @@ impl ConsumerGroupManager {
                                    member_list.iter().map(|(id, _)| id).collect::<Vec<_>>());
                             member_list
                         } else {
-                            // Non-leaders get empty list
                             debug!("Non-leader {} gets empty member list", member_id);
                             vec![]
                         },
                     })
                     } else {
-                        // Still collecting members
                         debug!("Still waiting for {} members to join group {}", 
                                group.members_joining.len(), group_id);
                         Err(GroupError::RebalanceInProgress)
@@ -403,9 +370,7 @@ impl ConsumerGroupManager {
             GroupState::AwaitingSync => {
                 debug!("Member {} attempting to join group {} in AwaitingSync state", member_id, group_id);
                 
-                // Check if this member is already part of the current generation
                 if group.members.contains_key(&member_id) {
-                    // Member is rejoining during sync - return success with current info
                     debug!("Member {} is part of current generation, returning join success", member_id);
                     Ok(JoinGroupResult {
                         error_code: 0,
@@ -422,7 +387,6 @@ impl ConsumerGroupManager {
                         },
                     })
                 } else {
-                    // New member trying to join during sync - reject to avoid disruption
                     debug!("New member {} trying to join during AwaitingSync, rejecting", member_id);
                     Err(GroupError::RebalanceInProgress)
                 }
@@ -452,23 +416,18 @@ impl ConsumerGroupManager {
             return Err(GroupError::UnknownMember);
         }
 
-        // Only accept sync in AwaitingSync state
         if group.state != GroupState::AwaitingSync {
             debug!("Group {} not in AwaitingSync state, current state: {:?}", group_id, group.state);
             return Err(GroupError::RebalanceInProgress);
         }
 
-        // Leader provides assignments for ALL members
         if member_id == group.leader_id {
             debug!("Leader {} sync_group with {} assignments", member_id, assignments.len());
             
-            // Debug: print what assignments we received
             for (mid, assignment) in &assignments {
                 debug!("  Assignment for member {}: {} bytes", mid, assignment.len());
             }
             
-            // Check if we need to calculate assignments
-            // Only calculate if leader only sent its own assignment
             let needs_calculation = assignments.len() == 1 && 
                                    assignments.contains_key(member_id) &&
                                    group.members.len() > 1;
@@ -476,16 +435,11 @@ impl ConsumerGroupManager {
             if needs_calculation {
                 debug!("Leader only sent its own assignment, calculating for all members!");
                 
-                // Get all member IDs
                 let member_ids: Vec<String> = group.members.keys().cloned().collect();
                 debug!("Group has {} members: {:?}", member_ids.len(), member_ids);
                 
-                // For now, use a simple round-robin assignment
-                // In reality, we should use the metadata from join_group to determine topics
-                // For testing, assume topic "test-rebalance" with 3 partitions
                 let mut calculated_assignments = HashMap::new();
                 
-                // Distribute partitions among members
                 for (idx, mid) in member_ids.iter().enumerate() {
                     let partitions = match member_ids.len() {
                         1 => vec![0, 1, 2], // One member gets all
@@ -498,10 +452,7 @@ impl ConsumerGroupManager {
                     
                     debug!("Calculating assignment for member {}: partitions {:?}", mid, partitions);
                     
-                    // Create assignment bytes
                     let assignment = if !partitions.is_empty() {
-                        // Extract topic from member metadata
-                        // For now, we'll use a heuristic - try common test topic names
                         let topic_name = if group_id.contains("rebalance") {
                             "test-rebalance"
                         } else if group_id.contains("two") {
@@ -509,7 +460,6 @@ impl ConsumerGroupManager {
                         } else if group_id.contains("sync") {
                             "test-sync-debug"
                         } else {
-                            // Default fallback
                             "test"
                         };
                         debug!("Using topic name '{}' for assignments based on group '{}'", topic_name, group_id);
@@ -521,7 +471,6 @@ impl ConsumerGroupManager {
                     calculated_assignments.insert(mid.clone(), assignment);
                 }
                 
-                // Apply calculated assignments
                 for (mid, assignment) in calculated_assignments {
                     if let Some(member) = group.members.get_mut(&mid) {
                         member.assignment = Some(assignment);
@@ -529,7 +478,6 @@ impl ConsumerGroupManager {
                     }
                 }
             } else {
-                // Use provided assignments
                 for (mid, assignment) in assignments {
                     if let Some(member) = group.members.get_mut(&mid) {
                         member.assignment = Some(assignment);
@@ -538,11 +486,8 @@ impl ConsumerGroupManager {
                 }
             }
             
-            // Don't go to Stable yet - wait for all members to sync
-            // We'll go to Stable when non-leaders sync and get their assignments
             debug!("Leader has distributed assignments, staying in AwaitingSync until all members sync");
             
-            // Update metrics when group becomes stable
             if let Some(metrics) = &self.metrics {
                 let runtime = tokio::runtime::Handle::try_current();
                 if let Ok(handle) = runtime {
@@ -564,42 +509,33 @@ impl ConsumerGroupManager {
             }
         }
 
-        // Get the member's assignment
         let member = group.members.get(member_id).unwrap();
         
-        // Debug: log current state
         debug!("SyncGroup: member {} in state {:?}, has assignment: {}", 
                member_id, group.state, member.assignment.is_some());
         
-        // If we have an assignment, return it
         if let Some(assignment) = &member.assignment {
             debug!("Returning assignment for member {} ({} bytes)", member_id, assignment.len());
             
-            // Mark this member as synced
             group.members_synced.insert(member_id.to_string());
             debug!("Member {} has synced, {} out of {} members synced", 
                    member_id, group.members_synced.len(), group.members.len());
             
-            // Check if all members have synced - if so, transition to Stable
             if group.state == GroupState::AwaitingSync && 
                group.members_synced.len() == group.members.len() {
                 debug!("All {} members have synced, transitioning to Stable", group.members.len());
                 group.state = GroupState::Stable;
                 
-                // Clear synced set for next rebalance
                 group.members_synced.clear();
             }
             
             return Ok(assignment.clone());
         }
         
-        // If no assignment yet and we're in AwaitingSync, the member should wait
         if group.state == GroupState::AwaitingSync {
-            // Return REBALANCE_IN_PROGRESS to make the client retry
             debug!("Member {} has no assignment yet in AwaitingSync, returning REBALANCE_IN_PROGRESS", member_id);
             Err(GroupError::RebalanceInProgress)
         } else {
-            // In other states, return empty assignment
             debug!("Member {} has no assignment in state {:?}, returning empty", member_id, group.state);
             Ok(create_empty_assignment())
         }
@@ -614,7 +550,6 @@ impl ConsumerGroupManager {
         let group = self.groups.get_mut(group_id)
             .ok_or(GroupError::UnknownGroup)?;
 
-        // During rebalance, return error to force rejoin
         if group.state == GroupState::PreparingRebalance {
             debug!("Heartbeat during rebalance for member {} in group {}", member_id, group_id);
             return Err(GroupError::RebalanceInProgress);
@@ -641,7 +576,6 @@ impl ConsumerGroupManager {
             let group = self.groups.get_mut(group_id)
                 .ok_or(GroupError::UnknownGroup)?;
 
-            // Remove member and clean up client mapping
             if let Some(member) = group.members.remove(member_id) {
                 let client_key = (group_id.to_string(), member._client_id.clone());
                 self.client_to_member.remove(&client_key);
@@ -651,7 +585,6 @@ impl ConsumerGroupManager {
             if group.members.is_empty() {
                 true
             } else {
-                // Trigger rebalance
                 group.state = GroupState::PreparingRebalance;
                 group.generation_id += 1;
                 group.members_joining.clear();
@@ -665,19 +598,15 @@ impl ConsumerGroupManager {
         };
 
         if should_remove {
-            // Remove the group but keep offsets for a while
-            // They will be cleaned up by cleanup_orphaned_offsets() after retention expires
             debug!("Group {} is now empty, removing group (keeping offsets temporarily)", group_id);
             self.groups.remove(group_id);
             
-            // Update metrics to reflect group removal
             if let Some(metrics) = &self.metrics {
                 let runtime = tokio::runtime::Handle::try_current();
                 if let Ok(handle) = runtime {
                     let metrics = metrics.clone();
                     let group_id_clone = group_id.to_string();
                     handle.spawn(async move {
-                        // Remove group from metrics
                         let mut groups = metrics.consumer_group_metrics.write().await;
                         groups.remove(&group_id_clone);
                     });
@@ -698,7 +627,6 @@ impl ConsumerGroupManager {
         
         if !self.groups.contains_key(group_id) {
             debug!("Creating group {} for offset commit", group_id);
-            // Create group if it doesn't exist - this is needed for simple consumers
             self.groups.insert(group_id.to_string(), ConsumerGroup {
                 _group_id: group_id.to_string(),
                 state: GroupState::Stable,
@@ -719,7 +647,6 @@ impl ConsumerGroupManager {
                 (offset, Instant::now())
             );
             
-            // Write to __commit_log for Snuba compatibility
             if let Some(storage) = &self.storage {
                 let key = create_commit_log_key(group_id, &topic, partition);
                 let value = create_commit_log_value(offset);
@@ -783,8 +710,6 @@ impl ConsumerGroupManager {
             for (member_id, member) in &group.members {
                 let timeout = Duration::from_millis(member.session_timeout_ms as u64);
                 let effective_timeout = if group.state == GroupState::PreparingRebalance {
-                    // During rebalancing, use a reasonable timeout
-                    // Don't make it too short or members will expire before they can rejoin!
                     timeout.min(Duration::from_secs(10))
                 } else {
                     timeout
@@ -798,7 +723,6 @@ impl ConsumerGroupManager {
         }
 
         for (group_id, member_id) in expired_members {
-            // Remove from joining members if in rebalancing
             if let Some(group) = self.groups.get_mut(&group_id) {
                 if group.state == GroupState::PreparingRebalance {
                     group.members_joining.remove(&member_id);
@@ -811,36 +735,26 @@ impl ConsumerGroupManager {
         
     }
     
-    /// Get the number of stored offsets (for monitoring)
     pub fn get_offset_count(&self) -> usize {
         self.offsets.len()
     }
     
-    /// Get all consumer group IDs (for metrics cleanup)
     pub fn get_all_group_ids(&self) -> Vec<String> {
         self.groups.keys().cloned().collect()
     }
     
-    /// Clean up offsets for groups that no longer exist or old offsets
-    /// This prevents unbounded memory growth from offset accumulation
     pub fn cleanup_orphaned_offsets(&mut self) {
         let initial_count = self.offsets.len();
         let initial_groups = self.groups.len();
         let now = Instant::now();
         
-        // Use configured retention times
         let offset_retention_with_group = Duration::from_millis(self.offset_retention_ms);
         let offset_retention_no_group = Duration::from_millis(self.offset_retention_ms / 12); // 1/12th for orphaned
         let empty_group_retention = Duration::from_millis(self.empty_group_retention_ms);
         
-        // First, clean up empty groups that are old enough
         let groups_to_remove: Vec<String> = self.groups.iter()
             .filter_map(|(group_id, group)| {
-                // Remove groups that:
-                // 1. Have no members
-                // 2. Have been empty for a while (check state)
                 if group.members.is_empty() && group.state != GroupState::PreparingRebalance {
-                    // Check if this group has recent offset activity
                     let has_recent_offsets = self.offsets.iter().any(|((g, _, _), (_, last_commit))| {
                         g == group_id && now.duration_since(*last_commit) < empty_group_retention
                     });
@@ -856,23 +770,19 @@ impl ConsumerGroupManager {
             })
             .collect();
         
-        // Remove empty groups
         for group_id in groups_to_remove {
             self.groups.remove(&group_id);
             debug!("Removed empty group: {}", group_id);
         }
         
-        // Now clean up offsets
         let existing_groups: std::collections::HashSet<_> = self.groups.keys().cloned().collect();
         
         self.offsets.retain(|(group_id, _, _), (_, last_commit)| {
             let age = now.duration_since(*last_commit);
             
             if existing_groups.contains(group_id) {
-                // Group exists - use longer retention
                 age < offset_retention_with_group
             } else {
-                // Group doesn't exist - use shorter retention
                 age < offset_retention_no_group
             }
         });
@@ -950,7 +860,6 @@ fn create_assignment_for_partitions(topic: &str, partitions: Vec<i32>) -> Bytes 
     if assignment.encode(&mut assignment_buf, 0).is_ok() {
         final_buf.extend_from_slice(&assignment_buf);
     } else {
-        // Fallback encoding
         final_buf.extend_from_slice(&[0, 0, 0, 0]); // 0 partitions
         final_buf.extend_from_slice(&[0, 0, 0, 0]); // 0 user data
     }
@@ -961,18 +870,14 @@ fn create_assignment_for_partitions(topic: &str, partitions: Vec<i32>) -> Bytes 
 fn create_commit_log_key(group_id: &str, topic: &str, partition: i32) -> Bytes {
     let mut buf = BytesMut::new();
     
-    // Version (2 bytes)
     buf.extend_from_slice(&1u16.to_be_bytes());
     
-    // Group ID length (2 bytes) + Group ID
     buf.extend_from_slice(&(group_id.len() as u16).to_be_bytes());
     buf.extend_from_slice(group_id.as_bytes());
     
-    // Topic length (2 bytes) + Topic
     buf.extend_from_slice(&(topic.len() as u16).to_be_bytes());
     buf.extend_from_slice(topic.as_bytes());
     
-    // Partition (4 bytes)
     buf.extend_from_slice(&partition.to_be_bytes());
     
     buf.freeze()
@@ -981,16 +886,12 @@ fn create_commit_log_key(group_id: &str, topic: &str, partition: i32) -> Bytes {
 fn create_commit_log_value(offset: i64) -> Bytes {
     let mut buf = BytesMut::new();
     
-    // Version (2 bytes)
     buf.extend_from_slice(&1u16.to_be_bytes());
     
-    // Offset (8 bytes)
     buf.extend_from_slice(&offset.to_be_bytes());
     
-    // Metadata length (2 bytes) + Metadata (empty)
     buf.extend_from_slice(&0u16.to_be_bytes());
     
-    // Timestamp (8 bytes) - current time in milliseconds
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

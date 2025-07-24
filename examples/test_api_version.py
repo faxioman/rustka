@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
-"""
-Test API version compatibility with librdkafka
-librdkafka automatically negotiates API versions, so this test just verifies basic functionality
-"""
 import time
 from confluent_kafka import Producer, Consumer, KafkaError
 
 def test_api_compatibility():
     print("=== Testing API version compatibility ===")
     
-    # Use unique topic to avoid reading old messages
     topic = f'test-api-version-{int(time.time() * 1000)}'
-    
-    # Producer - librdkafka auto-negotiates API version
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
-        'debug': 'broker',  # Enable broker debug to see API version negotiation
+        'debug': 'broker',
     })
-    
-    # Send a few messages
     delivered = 0
     def delivery_report(err, msg):
         nonlocal delivered
@@ -30,8 +21,6 @@ def test_api_compatibility():
     
     producer.flush()
     print(f"Produced {delivered} messages (librdkafka auto-negotiated API version)")
-    
-    # Consumer
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'test-{int(time.time())}',

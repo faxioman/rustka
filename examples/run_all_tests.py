@@ -41,7 +41,6 @@ TEST_ORDER = [
 ]
 
 def run_test(test_file, description):
-    """Run a single test file and return success status."""
     print(f"\n{'='*60}")
     print(f"Running: {test_file}")
     print(f"Description: {description}")
@@ -54,17 +53,15 @@ def run_test(test_file, description):
         return False
     
     try:
-        # Use the Python interpreter from command line or default python3
         python_cmd = sys.executable if sys.executable else 'python3'
         
         result = subprocess.run(
             [python_cmd, str(test_path)],
             capture_output=True,
             text=True,
-            timeout=60  # 60 second timeout per test
+            timeout=60
         )
         
-        # Print output
         if result.stdout:
             print(result.stdout)
         if result.stderr:
@@ -85,7 +82,6 @@ def run_test(test_file, description):
         return False
 
 def main():
-    """Run all tests and report summary."""
     print("="*60)
     print("RUSTKA TEST RUNNER")
     print("="*60)
@@ -104,13 +100,9 @@ def main():
             passed += 1
         else:
             failed += 1
-        
-        # Small delay between tests
         time.sleep(0.5)
     
     elapsed = time.time() - start_time
-    
-    # Summary
     print(f"\n{'='*60}")
     print("TEST SUMMARY")
     print('='*60)

@@ -16,7 +16,6 @@ except ImportError:
     sys.exit(1)
 
 def ensure_topics(topics):
-    """Ensure topics exist"""
     admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     new_topics = []
@@ -28,40 +27,33 @@ def ensure_topics(topics):
         try:
             f.result()
         except Exception as e:
-            pass  # Topic might already exist
+            pass
 
 def test_sentry_event_processing():
-    """Simulates Sentry event processing with consumer groups"""
     print("\n1. Testing Sentry-style event processing...")
-    
-    # Topics that Sentry uses
     topics = ['events', 'transactions', 'outcomes']
     ensure_topics(topics)
     
     events_processed = defaultdict(list)
     stop_flag = threading.Event()
     
-    # Use unique group ID for each test run to avoid reading old messages
     group_id = f'sentry-processors-{int(time.time() * 1000)}'
-    test_run_id = f'test-{int(time.time() * 1000)}'  # Unique ID for this test run
+    test_run_id = f'test-{int(time.time() * 1000)}'
     print(f"  Using consumer group: {group_id}")
     print(f"  Test run ID: {test_run_id}")
     
     def sentry_worker(worker_id, topics_to_consume):
-        """Simulates a Sentry worker"""
         print(f"  Worker {worker_id} starting...")
         try:
             consumer = Consumer({
                 'bootstrap.servers': '127.0.0.1:9092',
                 'group.id': group_id,
                 'auto.offset.reset': 'earliest',
-                'enable.auto.commit': False,  # Manual commit for debugging
+                'enable.auto.commit': False,
             })
             
             consumer.subscribe(topics_to_consume)
             print(f"  Worker {worker_id} connected and subscribed to {topics_to_consume}")
-            
-            # Force assignment check
             consumer.poll(timeout=0.1)
             assignment = consumer.assignment()
             print(f"  Worker {worker_id} assigned partitions: {assignment}")
@@ -83,7 +75,6 @@ def test_sentry_event_processing():
             
             try:
                 value = json.loads(msg.value().decode('utf-8'))
-                # Only count messages from this test run
                 if value.get('test_run_id') == test_run_id:
                     event_data = {
                         'topic': msg.topic(),
@@ -93,14 +84,11 @@ def test_sentry_event_processing():
                     }
                     events_processed[worker_id].append(event_data)
                     print(f"  Worker {worker_id} processed: topic={msg.topic()}, partition={msg.partition()}, offset={msg.offset()}")
-                    # Commit offset to prevent re-reading on rebalance
                     consumer.commit(msg)
             except Exception as e:
                 print(f"  Worker {worker_id} decode error: {e}")
         
         consumer.close()
-    
-    # First produce all events
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
     })
@@ -111,9 +99,7 @@ def test_sentry_event_processing():
         if err is None:
             delivered += 1
     
-    # Produce different event types
     for i in range(10):
-        # Error event
         producer.produce('events', 
                          key=f'project-{i % 3}'.encode('utf-8'),
                          value=json.dumps({
@@ -124,8 +110,6 @@ def test_sentry_event_processing():
                              'timestamp': time.time()
                          }).encode('utf-8'),
                          callback=delivery_report)
-        
-        # Transaction event
         producer.produce('transactions',
                          key=f'project-{i % 3}'.encode('utf-8'),
                          value=json.dumps({
@@ -136,8 +120,6 @@ def test_sentry_event_processing():
                              'duration': 100 + i * 10
                          }).encode('utf-8'),
                          callback=delivery_report)
-        
-        # Outcome event
         producer.produce('outcomes',
                          value=json.dumps({
                              'test_run_id': test_run_id,
@@ -149,9 +131,7 @@ def test_sentry_event_processing():
     
     producer.flush()
     print(f"✓ Produced {delivered} events")
-    time.sleep(1)  # Give broker time to process
-    
-    # Now start workers AFTER messages are produced
+    time.sleep(1)
     workers = []
     for i in range(3):
         t = threading.Thread(
@@ -161,42 +141,33 @@ def test_sentry_event_processing():
         )
         t.start()
         workers.append(t)
-        time.sleep(0.5)  # Stagger worker starts
+        time.sleep(0.5)
     
-    # Let workers process
-    time.sleep(10)  # Even more time for processing
+    time.sleep(10)
     stop_flag.set()
     
     for t in workers:
-        t.join(timeout=2)  # Don't wait forever
-    
-    # Verify results
+        t.join(timeout=2)
     total_processed = sum(len(events) for events in events_processed.values())
     workers_that_processed = len(events_processed)
     
     print(f"✓ {total_processed} events processed by {workers_that_processed} workers")
-    
-    # Check that work was distributed
     if workers_that_processed > 1:
         print("✓ Work distributed across multiple workers")
     else:
         print("⚠ All work went to a single worker (might be normal for small dataset)")
     
-    # WE SHOULD HAVE 30 EVENTS!
     if total_processed != 30:
         print(f"✗ MISSING EVENTS: Expected 30, got {total_processed}")
     
-    return total_processed == 30  # Must be EXACTLY 30
+    return total_processed == 30
 
 def test_sentry_offset_tracking():
-    """Test that offsets are tracked correctly for recovery"""
     print("\n2. Testing Sentry-style offset tracking...")
     
     group_id = f'sentry-offset-test-{int(time.time() * 1000)}'
     topic = 'events'
     test_run_id = f'offset-test-{int(time.time() * 1000)}'
-    
-    # Send test messages
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
     })
@@ -218,8 +189,6 @@ def test_sentry_offset_tracking():
     producer.flush()
     print(f"  Produced {delivered} messages")
     time.sleep(0.5)
-    
-    # Consumer 1: Read messages with manual commit
     consumer1 = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': group_id,
@@ -250,8 +219,6 @@ def test_sentry_offset_tracking():
             if value.get('test_run_id') == test_run_id:
                 processed_messages.append(value['message_id'])
                 print(f"  - Processed message {value['message_id']}")
-                
-                # Commit after each message
                 consumer1.commit()
                 
                 if len(processed_messages) >= 5:
@@ -261,8 +228,6 @@ def test_sentry_offset_tracking():
     
     consumer1.close()
     print(f"✓ First consumer processed {len(processed_messages)} messages: {processed_messages}")
-    
-    # Consumer 2: Same group, should NOT get the same messages
     consumer2 = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': group_id,
@@ -302,8 +267,6 @@ def test_sentry_offset_tracking():
             print(f"  Decode error: {e}")
     
     consumer2.close()
-    
-    # Evaluate results
     success = True
     
     if duplicate_messages:
@@ -322,17 +285,14 @@ def test_sentry_offset_tracking():
     return success
 
 def test_sentry_high_throughput():
-    """Test high throughput scenario typical of Sentry"""
     print("\n3. Testing high throughput scenario...")
     
     num_events = 100
     test_run_id = f'throughput-test-{int(time.time() * 1000)}'
     start_time = time.time()
-    
-    # Produce many events quickly
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
-        'batch.size': 16384,  # Batch for efficiency
+        'batch.size': 16384,
         'linger.ms': 10,
     })
     
@@ -347,7 +307,7 @@ def test_sentry_high_throughput():
             'test_run_id': test_run_id,
             'event_id': i,
             'timestamp': time.time(),
-            'data': 'x' * 1000  # 1KB payload
+            'data': 'x' * 1000
         }).encode('utf-8'), callback=delivery_report)
     
     producer.flush()
@@ -356,14 +316,12 @@ def test_sentry_high_throughput():
     events_per_second = delivered / produce_time if produce_time > 0 else 0
     
     print(f"✓ Produced {delivered} events in {produce_time:.2f}s ({events_per_second:.0f} events/sec)")
-    
-    # Consume with high throughput settings
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'perf-test-{int(time.time())}',
         'auto.offset.reset': 'earliest',
-        'fetch.min.bytes': 1,  # Don't wait for more bytes
-        'fetch.wait.max.ms': 10,  # Reduce wait time
+        'fetch.min.bytes': 1,
+        'fetch.wait.max.ms': 10,
     })
     
     consumer.subscribe(['events'])
@@ -404,7 +362,7 @@ def test_sentry_high_throughput():
     
     print(f"✓ Consumed {consumed} events in {consume_time:.2f}s ({consume_rate:.0f} events/sec)")
     
-    return consumed == num_events  # Should consume exactly all our test events
+    return consumed == num_events
 
 def main():
     print("=== Sentry Kafka Compatibility Test ===")

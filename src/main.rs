@@ -2,7 +2,6 @@ use rustka::{broker, dashboard, metrics::MetricsCollector};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-// Use jemalloc as global allocator with aggressive memory return
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 
@@ -12,7 +11,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure jemalloc to return memory more aggressively
     #[cfg(not(target_env = "msvc"))]
     {
         std::env::set_var("MALLOC_CONF", "dirty_decay_ms:10000,muzzy_decay_ms:10000");

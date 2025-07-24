@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Test that verifies __commit_log messages are compatible with Snuba's expectations
-"""
 from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 import time
@@ -9,7 +6,6 @@ import json
 import struct
 
 def ensure_topic(topic_name):
-    """Ensure topic exists"""
     admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     try:
@@ -19,12 +15,11 @@ def ensure_topic(topic_name):
             try:
                 f.result()
             except Exception as e:
-                pass  # Topic might already exist
+                pass
     except Exception as e:
         pass
 
 def parse_commit_log_key(key_bytes):
-    """Parse the commit log key format"""
     if not key_bytes or len(key_bytes) < 8:
         return None
     
@@ -32,24 +27,17 @@ def parse_commit_log_key(key_bytes):
     result = {}
     
     try:
-        # Version (2 bytes)
         version = struct.unpack('>H', key_bytes[offset:offset+2])[0]
         offset += 2
         result['version'] = version
-        
-        # Group ID length (2 bytes) + Group ID
         group_len = struct.unpack('>H', key_bytes[offset:offset+2])[0]
         offset += 2
         result['group_id'] = key_bytes[offset:offset+group_len].decode('utf-8')
         offset += group_len
-        
-        # Topic length (2 bytes) + Topic
         topic_len = struct.unpack('>H', key_bytes[offset:offset+2])[0]
         offset += 2
         result['topic'] = key_bytes[offset:offset+topic_len].decode('utf-8')
         offset += topic_len
-        
-        # Partition (4 bytes)
         result['partition'] = struct.unpack('>I', key_bytes[offset:offset+4])[0]
         
         return result
@@ -58,7 +46,6 @@ def parse_commit_log_key(key_bytes):
         return None
 
 def parse_commit_log_value(value_bytes):
-    """Parse the commit log value format"""
     if not value_bytes or len(value_bytes) < 4:
         return None
     
@@ -66,16 +53,11 @@ def parse_commit_log_value(value_bytes):
     result = {}
     
     try:
-        # Version (2 bytes)
         version = struct.unpack('>H', value_bytes[offset:offset+2])[0]
         offset += 2
         result['version'] = version
-        
-        # Offset (8 bytes)
         result['offset'] = struct.unpack('>q', value_bytes[offset:offset+8])[0]
         offset += 8
-        
-        # Metadata length (2 bytes) + Metadata
         metadata_len = struct.unpack('>H', value_bytes[offset:offset+2])[0]
         offset += 2
         if metadata_len > 0:

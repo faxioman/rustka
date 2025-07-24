@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""
-Test with modern API version to see if throughput improves
-"""
 from confluent_kafka import Producer, Consumer, KafkaError
 import time
 import json
 
-# librdkafka automatically negotiates the best API version
-# so we'll test throughput directly
-
 topic = f'api-test-{int(time.time())}'
-
-# Skip topic creation - let Rustka auto-create it
-# This avoids potential issues with AdminClient
-
-# Produce 50 messages
 producer = Producer({
     'bootstrap.servers': '127.0.0.1:9092',
 })
@@ -30,24 +19,19 @@ for i in range(50):
 
 producer.flush()
 print(f"✓ Produced {delivered} messages")
-
-# Test different consumer configurations
 configs = [
     {'name': 'Default config', 'config': {}},
-    {'name': 'Large batch', 'config': {'fetch.max.bytes': 52428800}},  # 50MB
+    {'name': 'Large batch', 'config': {'fetch.max.bytes': 52428800}},
     {'name': 'Small timeout', 'config': {'fetch.wait.max.ms': 100}},
 ]
 
 for idx, test_config in enumerate(configs):
     print(f"\n--- Testing {test_config['name']} ---")
-    
-    # Base consumer config
     config = {
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'test-{int(time.time())}-{idx}',
         'auto.offset.reset': 'earliest',
     }
-    # Add test-specific config
     config.update(test_config['config'])
     
     consumer = Consumer(config)

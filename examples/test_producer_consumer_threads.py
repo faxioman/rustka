@@ -7,8 +7,6 @@ import time
 from threading import Thread, Event
 
 TOPIC_NAME = f'test-producer-consumer-threads-{int(time.time())}'
-
-# Create topic
 admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
 new_topic = NewTopic(TOPIC_NAME, num_partitions=3, replication_factor=1)
 fs = admin.create_topics([new_topic])
@@ -16,7 +14,7 @@ for topic, f in fs.items():
     try:
         f.result()
     except Exception as e:
-        pass  # Topic might already exist
+        pass
 
 def producer_thread():
     producer = Producer({
@@ -35,7 +33,7 @@ def producer_thread():
         data = {"counter": i, "timestamp": time.time()}
         producer.produce(TOPIC_NAME, value=json.dumps(data).encode(), callback=delivery_report)
         if i % 10 == 0:
-            producer.poll(0)  # Trigger delivery reports
+            producer.poll(0)
         time.sleep(0.1)
     
     producer.flush()

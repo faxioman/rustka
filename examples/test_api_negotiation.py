@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""
-Test API version negotiation with librdkafka
-librdkafka always auto-negotiates, so we just verify it works
-"""
 from confluent_kafka import Producer, Consumer
 import time
 
 def test_auto_negotiation():
     print("Testing API version negotiation...")
-    
-    # librdkafka ALWAYS auto-negotiates API versions
     print("\n1. Creating producer (librdkafka auto-negotiates)...")
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
@@ -33,8 +27,6 @@ def test_auto_negotiation():
     else:
         print("✗ Failed to deliver message")
         return False
-    
-    # Test consumer
     print("\n2. Creating consumer (librdkafka auto-negotiates)...")
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
@@ -44,8 +36,6 @@ def test_auto_negotiation():
     print("✓ Consumer created successfully with auto-negotiation")
     
     consumer.subscribe([topic])
-    
-    # Consume the message
     start_time = time.time()
     consumed = False
     while time.time() - start_time < 2:

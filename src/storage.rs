@@ -81,7 +81,6 @@ impl InMemoryStorage {
     pub fn append_records_with_headers(&mut self, topic: &str, partition: i32, key: Option<Bytes>, value: Bytes, headers: IndexMap<StrBytes, Option<Bytes>>) -> i64 {
         let topic_entry = self.topics.entry(topic.to_string()).or_insert_with(|| {
             let mut partitions = HashMap::new();
-            // Auto-create 3 partitions by default
             for i in 0..3 {
                 partitions.insert(i, Partition {
                     records: VecDeque::new(),
@@ -117,11 +116,9 @@ impl InMemoryStorage {
         });
         partition_entry.next_offset += 1;
         
-        // Retention policy: size and time based
         const MAX_MESSAGES_PER_PARTITION: usize = 1000;
         const MAX_MESSAGE_AGE: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
         
-        // Remove old messages based on time
         let now = Instant::now();
         while let Some(front) = partition_entry.records.front() {
             if now.duration_since(front.timestamp) > MAX_MESSAGE_AGE {
@@ -143,7 +140,6 @@ impl InMemoryStorage {
     }
     
 
-    // Fetch multiple records in MessageSet format for API v3 and below
     pub fn fetch_batch_legacy(
         &self,
         topic: &str,
@@ -171,7 +167,6 @@ impl InMemoryStorage {
         let mut record_count = 0;
         
         while current_offset < high_watermark && total_size < max_bytes {
-            // Skip if offset is before our base_offset (already deleted)
             if current_offset < partition_data.base_offset {
                 current_offset += 1;
                 continue;
@@ -186,25 +181,14 @@ impl InMemoryStorage {
             
             let mut message = BytesMut::new();
             
-            // Message format (v0/v1):
-            // CRC (4 bytes)
-            // Magic (1 byte) - 0 for v0, 1 for v1
-            // Attributes (1 byte) - 0 for no compression
-            // Key length (4 bytes) - -1 for null
-            // Key (variable) - empty for null
-            // Value length (4 bytes)
-            // Value (variable)
             
-            // For now, use magic 0 (v0) for simplicity
             let magic: u8 = 0;
             let attributes: u8 = 0;
             
-            // Build the message content (after CRC)
             let mut msg_content = BytesMut::new();
             msg_content.put_u8(magic);
             msg_content.put_u8(attributes);
             
-            // Key handling
             if let Some(key) = &record.key {
                 msg_content.put_i32(key.len() as i32); // key length
                 msg_content.extend_from_slice(key); // key
@@ -212,30 +196,21 @@ impl InMemoryStorage {
                 msg_content.put_i32(-1); // null key
             }
             
-            // Value handling
             msg_content.put_i32(record.value.len() as i32); // value length
             msg_content.extend_from_slice(&record.value); // value
             
-            // Calculate CRC32 of the message content
             let crc = crc32(&msg_content);
             
-            // Build the complete message
             message.put_u32(crc);
             message.extend_from_slice(&msg_content);
             
-            // MessageSet entry format:
-            // Offset (8 bytes)
-            // Message size (4 bytes)
-            // Message (variable)
             
             let message_size = message.len() as i32;
             
-            // Check if this message would exceed max_bytes
             if record_count > 0 && total_size + 12 + message_size > max_bytes {
                 break;
             }
             
-            // Write MessageSet entry
             message_set.put_i64(current_offset); // offset
             message_set.put_i32(message_size); // message size
             message_set.extend_from_slice(&message); // message
@@ -244,7 +219,6 @@ impl InMemoryStorage {
             record_count += 1;
             current_offset += 1;
             
-            // Limit batch size
             if record_count >= 50 {
                 break;
             }
@@ -257,7 +231,6 @@ impl InMemoryStorage {
         }
     }
     
-    // Fetch multiple records in RecordBatch format for API v4 and above
     pub fn fetch_batch_recordbatch(
         &self,
         topic: &str,
@@ -279,13 +252,11 @@ impl InMemoryStorage {
             return Ok((high_watermark, None));
         }
         
-        // Collect records to batch
         let mut records = Vec::new();
         let mut current_offset = offset;
         let mut estimated_size = 0;
         
         while current_offset < high_watermark && estimated_size < max_bytes as usize {
-            // Skip if offset is before our base_offset (already deleted)
             if current_offset < partition_data.base_offset {
                 current_offset += 1;
                 continue;
@@ -318,7 +289,6 @@ impl InMemoryStorage {
                 debug!("Creating RecordBatch record at offset {} with {} headers", current_offset, headers_count);
             }
             
-            // Estimate size (rough approximation)
             estimated_size += 50; // Base overhead
             if let Some(ref key) = stored_record.key {
                 estimated_size += key.len();
@@ -328,7 +298,6 @@ impl InMemoryStorage {
             records.push(record);
             current_offset += 1;
             
-            // Ensure we have at least one record
             if records.len() > 0 && estimated_size >= max_bytes as usize {
                 break;
             }
@@ -338,7 +307,6 @@ impl InMemoryStorage {
             return Ok((high_watermark, None));
         }
         
-        // Encode records as RecordBatch v2
         let mut buf = BytesMut::new();
         let options = RecordEncodeOptions {
             version: 2,
@@ -353,13 +321,10 @@ impl InMemoryStorage {
         }
     }
     
-    // Methods fetch_records, fetch_single_record, and fetch_records_multi were removed
-    // as they were not used in production code
     
     pub fn topic_has_headers(&self, topic: &str, partition: i32) -> bool {
         if let Some(topic_data) = self.topics.get(topic) {
             if let Some(partition_data) = topic_data.partitions.get(&partition) {
-                // Check if any record has headers
                 return partition_data.records.iter().any(|r| !r.headers.is_empty());
             }
         }
@@ -384,7 +349,6 @@ impl InMemoryStorage {
         
         for topic in self.topics.values_mut() {
             for partition in topic.partitions.values_mut() {
-                // Remove messages older than MAX_MESSAGE_AGE
                 while let Some(front) = partition.records.front() {
                     if now.duration_since(front.timestamp) > MAX_MESSAGE_AGE {
                         if let Some(removed) = partition.records.pop_front() {
@@ -395,17 +359,13 @@ impl InMemoryStorage {
                     }
                 }
                 
-                // More aggressive VecDeque capacity management to prevent memory bloat
                 let len = partition.records.len();
                 let cap = partition.records.capacity();
                 
-                // Shrink if using less than 25% of capacity and capacity is significant
                 if cap > 32 && len < cap / 4 {
-                    // Shrink to 2x current size to leave some headroom
                     let new_cap = (len * 2).max(16);
                     partition.records.shrink_to(new_cap);
                 } else if partition.records.is_empty() && cap > 16 {
-                    // If completely empty, shrink to minimal size
                     partition.records.shrink_to_fit();
                 }
             }
@@ -415,7 +375,6 @@ impl InMemoryStorage {
     pub fn clear_all_messages(&mut self) {
         for topic in self.topics.values_mut() {
             for partition in topic.partitions.values_mut() {
-                // Clear all messages but keep the offset history
                 partition.records.clear();
                 partition.records.shrink_to_fit();
                 partition.base_offset = partition.next_offset;
@@ -430,8 +389,6 @@ impl InMemoryStorage {
             let mut all_empty = true;
             
             for partition in topic.partitions.values() {
-                // A partition is empty if it has no records
-                // We don't check next_offset because it keeps the history
                 if !partition.records.is_empty() {
                     all_empty = false;
                     break;
@@ -445,7 +402,6 @@ impl InMemoryStorage {
         
         let count = empty_topics.len();
         
-        // Remove empty topics
         for topic_name in empty_topics {
             self.topics.remove(&topic_name);
         }
@@ -464,7 +420,6 @@ impl InMemoryStorage {
                 total_partitions += 1;
                 total_messages += partition.records.len();
                 
-                // Check oldest message age
                 if let Some(first_record) = partition.records.front() {
                     let age = first_record.timestamp.elapsed();
                     oldest_message_age = Some(oldest_message_age.map_or(age, |old: std::time::Duration| old.max(age)));

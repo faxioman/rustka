@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Test that simulates Arroyo/librdkafka behavior with consumer groups
-This should test the REBALANCE_IN_PROGRESS issue we fixed
-"""
 import sys
 import time
 import threading
@@ -10,7 +6,6 @@ from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 
 def setup_topics():
-    """Create topics with 3 partitions each like Snuba"""
     admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     topics = ['outcomes_raw', 'events', 'transactions', 'sessions']
@@ -27,7 +22,7 @@ def setup_topics():
         fs = admin.create_topics(new_topics)
         for topic, f in fs.items():
             try:
-                f.result()  # The result itself is None
+                f.result()
                 print(f"Created topic {topic}")
             except Exception as e:
                 print(f"Topic {topic} might already exist: {e}")
@@ -37,10 +32,7 @@ def setup_topics():
     return topics
 
 def simulate_arroyo_consumer(consumer_id, topic, group_id, error_log):
-    """Simulate Arroyo consumer behavior using librdkafka"""
     print(f"Starting Arroyo consumer {consumer_id} for topic {topic}")
-    
-    # Arroyo uses these settings
     config = {
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': group_id,
@@ -60,7 +52,7 @@ def simulate_arroyo_consumer(consumer_id, topic, group_id, error_log):
     
     try:
         start_time = time.time()
-        while time.time() - start_time < 30:  # Run for 30 seconds
+        while time.time() - start_time < 30:
             msg = consumer.poll(1.0)
             
             if msg is None:
@@ -91,7 +83,6 @@ def simulate_arroyo_consumer(consumer_id, topic, group_id, error_log):
         print(f"Consumer {consumer_id} finished: {messages_consumed} messages, {rebalance_errors} rebalance errors")
 
 def produce_messages(topics):
-    """Produce messages to topics"""
     producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
     
     print("Producing messages...")

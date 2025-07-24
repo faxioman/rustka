@@ -76,7 +76,6 @@ async fn metrics_long_poll_handler(
         .unwrap()
         .as_millis() as u64;
     
-    // Maximum wait time for long polling (30 seconds)
     let max_wait = Duration::from_secs(30);
     let poll_interval = Duration::from_millis(100);
     
@@ -84,7 +83,6 @@ async fn metrics_long_poll_handler(
         let mut last_metrics = if query.last_update.is_some() {
             state.metrics.get_all_metrics().await
         } else {
-            // First request, return immediately
             return state.metrics.get_all_metrics().await;
         };
         
@@ -92,7 +90,6 @@ async fn metrics_long_poll_handler(
             sleep(poll_interval).await;
             let current_metrics = state.metrics.get_all_metrics().await;
             
-            // Check if metrics have changed
             if has_metrics_changed(&last_metrics, &current_metrics) {
                 return current_metrics;
             }
@@ -104,7 +101,6 @@ async fn metrics_long_poll_handler(
     let metrics = match result {
         Ok(metrics) => metrics,
         Err(_) => {
-            // Timeout - return current metrics
             state.metrics.get_all_metrics().await
         }
     };
@@ -121,7 +117,6 @@ async fn metrics_long_poll_handler(
 }
 
 fn has_metrics_changed(old: &AllMetrics, new: &AllMetrics) -> bool {
-    // Compare key metrics to detect changes
     old.broker.total_messages_produced != new.broker.total_messages_produced ||
     old.broker.total_messages_fetched != new.broker.total_messages_fetched ||
     old.broker.active_connections != new.broker.active_connections ||
@@ -129,7 +124,6 @@ fn has_metrics_changed(old: &AllMetrics, new: &AllMetrics) -> bool {
     old.broker.storage_total_messages != new.broker.storage_total_messages ||
     old.topics.len() != new.topics.len() ||
     old.consumer_groups.len() != new.consumer_groups.len() ||
-    // Check if any topic message counts changed
     old.topics.iter().any(|(topic_name, topic_metrics)| {
         new.topics.get(topic_name)
             .map_or(true, |new_topic| new_topic.total_messages != topic_metrics.total_messages)
@@ -149,15 +143,12 @@ async fn cleanup_empty_topics_handler(
     let mut storage = state.storage.lock().await;
     let count = storage.cleanup_empty_topics();
     
-    // Get remaining topics and update storage stats
     let remaining_topics = storage.get_all_topics();
     let stats = storage.get_storage_stats();
     drop(storage); // Release lock before async operations
     
-    // Update storage stats
     state.metrics.update_storage_stats(stats).await;
     
-    // Clean up topic metrics for removed topics
     state.metrics.cleanup_topic_metrics(&remaining_topics).await;
     
     Ok(Json(CleanupResponse {
@@ -172,14 +163,11 @@ async fn cleanup_all_messages_handler(
 ) -> Result<Json<CleanupResponse>, StatusCode> {
     let mut storage = state.storage.lock().await;
     
-    // Count messages before clearing
     let stats = storage.get_storage_stats();
     let message_count = stats.total_messages;
     
-    // Clear all messages from all topics
     storage.clear_all_messages();
     
-    // Update storage stats in metrics immediately after cleanup
     let new_stats = storage.get_storage_stats();
     drop(storage); // Release lock before async operation
     
@@ -214,7 +202,6 @@ async fn memory_stats_handler(
         retained_mb: 0.0,
     };
     
-    // Get process RSS
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -235,7 +222,6 @@ async fn memory_stats_handler(
         unsafe {
             let mut sz = std::mem::size_of::<usize>();
             
-            // Allocated bytes
             let mut allocated: usize = 0;
             tikv_jemalloc_sys::mallctl(
                 b"stats.allocated\0".as_ptr() as *const _,
@@ -246,7 +232,6 @@ async fn memory_stats_handler(
             );
             stats.allocated_mb = allocated as f64 / 1024.0 / 1024.0;
             
-            // Active bytes
             let mut active: usize = 0;
             tikv_jemalloc_sys::mallctl(
                 b"stats.active\0".as_ptr() as *const _,
@@ -257,7 +242,6 @@ async fn memory_stats_handler(
             );
             stats.active_mb = active as f64 / 1024.0 / 1024.0;
             
-            // Mapped bytes
             let mut mapped: usize = 0;
             tikv_jemalloc_sys::mallctl(
                 b"stats.mapped\0".as_ptr() as *const _,
@@ -268,7 +252,6 @@ async fn memory_stats_handler(
             );
             stats.mapped_mb = mapped as f64 / 1024.0 / 1024.0;
             
-            // Metadata bytes
             let mut metadata: usize = 0;
             tikv_jemalloc_sys::mallctl(
                 b"stats.metadata\0".as_ptr() as *const _,
@@ -279,7 +262,6 @@ async fn memory_stats_handler(
             );
             stats.metadata_mb = metadata as f64 / 1024.0 / 1024.0;
             
-            // Retained bytes
             let mut retained: usize = 0;
             tikv_jemalloc_sys::mallctl(
                 b"stats.retained\0".as_ptr() as *const _,

@@ -128,7 +128,6 @@ impl KafkaBroker {
                 
                 metrics_clone.cleanup_topic_metrics(&topics).await;
                 
-                // Note: We do NOT automatically cleanup consumer groups as this could break clients
             }
         });
 
@@ -244,23 +243,23 @@ async fn handle_connection(
         metrics.increment_requests().await;
         
         let response_result = match header.request_api_key {
-            18 => Ok((handle_api_versions(&header).await?, false)), // ApiVersions
-            3 => Ok((handle_metadata(&header, &mut buf, storage.clone()).await?, false)), // Metadata
-            0 => Ok((handle_produce(&header, &mut buf, storage.clone(), metrics.clone()).await?, false)), // Produce
-            1 => Ok((handle_fetch(&header, &mut buf, storage.clone(), metrics.clone()).await?, false)), // Fetch
-            2 => Ok((handle_list_offsets(&header, &mut buf, storage.clone()).await?, false)), // ListOffsets
-            10 => Ok((handle_find_coordinator(&header, &mut buf, group_manager.clone()).await?, false)), // FindCoordinator
-            11 => Ok((handle_join_group(&header, &mut buf, group_manager.clone(), &peer_addr).await?, false)), // JoinGroup
-            14 => Ok((handle_sync_group(&header, &mut buf, group_manager.clone()).await?, false)), // SyncGroup
-            12 => Ok((handle_heartbeat(&header, &mut buf, group_manager.clone()).await?, false)), // Heartbeat
-            8 => Ok((handle_offset_commit(&header, &mut buf, group_manager.clone()).await?, false)), // OffsetCommit
-            9 => Ok((handle_offset_fetch(&header, &mut buf, group_manager.clone()).await?, false)), // OffsetFetch
-            13 => Ok((handle_leave_group(&header, &mut buf, group_manager.clone()).await?, false)), // LeaveGroup
-            17 => handle_sasl_handshake(&header, &mut buf).await, // SaslHandshake - returns (response, expecting_raw_auth)
+            18 => Ok((handle_api_versions(&header).await?, false)),
+            3 => Ok((handle_metadata(&header, &mut buf, storage.clone()).await?, false)),
+            0 => Ok((handle_produce(&header, &mut buf, storage.clone(), metrics.clone()).await?, false)),
+            1 => Ok((handle_fetch(&header, &mut buf, storage.clone(), metrics.clone()).await?, false)),
+            2 => Ok((handle_list_offsets(&header, &mut buf, storage.clone()).await?, false)),
+            10 => Ok((handle_find_coordinator(&header, &mut buf, group_manager.clone()).await?, false)),
+            11 => Ok((handle_join_group(&header, &mut buf, group_manager.clone(), &peer_addr).await?, false)),
+            14 => Ok((handle_sync_group(&header, &mut buf, group_manager.clone()).await?, false)),
+            12 => Ok((handle_heartbeat(&header, &mut buf, group_manager.clone()).await?, false)),
+            8 => Ok((handle_offset_commit(&header, &mut buf, group_manager.clone()).await?, false)),
+            9 => Ok((handle_offset_fetch(&header, &mut buf, group_manager.clone()).await?, false)),
+            13 => Ok((handle_leave_group(&header, &mut buf, group_manager.clone()).await?, false)),
+            17 => handle_sasl_handshake(&header, &mut buf).await,
             36 => {
                 let response = handle_sasl_authenticate(&header, &mut buf, &mut conn_state).await?;
                 Ok((response, false))
-            }, // SaslAuthenticate
+            },
             _ => {
                 error!("Unsupported API key: {}", header.request_api_key);
                 continue;
@@ -285,7 +284,6 @@ async fn handle_connection(
     Ok(())
 }
 
-// Parse RecordBatch (magic byte 2) and extract messages with key, value and headers
 fn parse_record_batch(data: &Bytes) -> Vec<(Option<Bytes>, Bytes, IndexMap<StrBytes, Option<Bytes>>)> {
     let mut messages = Vec::new();
     let data_copy = Bytes::copy_from_slice(data.as_ref());
@@ -622,15 +620,12 @@ async fn handle_produce(
                 let preview = &records.as_ref()[..std::cmp::min(100, records.len())];
                 debug!("Records preview (first {} bytes): {:?}", preview.len(), preview);
                 
-                // Check magic byte to determine format
                 let magic_byte = if records.len() >= 17 { records.as_ref()[16] } else { 0 };
                 debug!("Produce API v{}, magic byte: {}", header.request_api_version, magic_byte);
                 
                 let mut base_offset = 0i64;
                 let message_count: u64;
                 
-                // Support RecordBatch (magic=2) even with API v2 (Kafka 0.11+)
-                // But also try to parse as RecordBatch first, regardless of magic byte
                 let batch_messages = parse_record_batch(&records);
                 if !batch_messages.is_empty() {
                     debug!("Successfully extracted {} messages from RecordBatch", batch_messages.len());
@@ -658,7 +653,6 @@ async fn handle_produce(
                             }
                         } else {
                             error!("Failed to parse any messages from RecordBatch/MessageSet for topic '{}' partition {}", topic_name, partition);
-                            // Don't store raw bytes, return error
                             let mut partition_response = PartitionProduceResponse::default();
                             partition_response.index = partition;
                             partition_response.error_code = 2; // CORRUPT_MESSAGE
@@ -750,8 +744,6 @@ async fn handle_fetch(
                    partition.partition_max_bytes);
             
             let has_headers = storage.topic_has_headers(&topic_name, partition.partition);
-            // Use RecordBatch for API v2+ to support headers properly
-            // confluent-kafka often uses API v3 which needs RecordBatch for headers
             let needs_record_batch = header.request_api_version >= 2;
             
             debug!("Fetch decision: api_version={}, has_headers={}, needs_record_batch={}", 
@@ -769,7 +761,6 @@ async fn handle_fetch(
                     Ok((hw, record_batch)) => {
                         debug!("RecordBatch fetch v{}: offset={}, hw={}, has_batch={}", 
                             header.request_api_version, partition.fetch_offset, hw, record_batch.is_some());
-                        // Count messages fetched
                         if record_batch.is_some() && hw > partition.fetch_offset {
                             let messages_in_batch = (hw - partition.fetch_offset) as u64;
                             total_messages_fetched += messages_in_batch;
@@ -782,7 +773,6 @@ async fn handle_fetch(
                     }
                 }
             } else {
-                // For older API versions, use MessageSet format
                 let batch_result = storage.fetch_batch_legacy(
                     &topic_name,
                     partition.partition,
@@ -794,15 +784,12 @@ async fn handle_fetch(
                     Ok((hw, message_set)) => {
                         debug!("Legacy fetch v{}: offset={}, hw={}, has_messageset={}", 
                             header.request_api_version, partition.fetch_offset, hw, message_set.is_some());
-                        // Count messages fetched
                         if message_set.is_some() && hw > partition.fetch_offset {
-                            // Parse MessageSet to count actual messages
                             if let Some(ref ms_bytes) = message_set {
                                 let messages = parse_message_set(ms_bytes);
                                 total_messages_fetched += messages.len() as u64;
                             }
                         }
-                        // Always return Some(Bytes), never None
                         (0, hw, Some(message_set.unwrap_or_else(Bytes::new)))
                     },
                     Err(e) => {
@@ -838,7 +825,6 @@ async fn handle_fetch(
     response.session_id = 0;
     response.responses = responses;
 
-    // Update fetch metrics
     if total_messages_fetched > 0 {
         metrics.increment_messages_fetched(total_messages_fetched).await;
     }
@@ -862,7 +848,6 @@ async fn handle_find_coordinator(
     
     let _request = FindCoordinatorRequest::decode(buf, header.request_api_version)?;
     
-    // For simplicity, we are always the coordinator
     let mut response = FindCoordinatorResponse::default();
     response.throttle_time_ms = 0;
     response.error_code = 0;
@@ -987,7 +972,6 @@ async fn handle_sync_group(
         }
         Err(e) => {
             response.error_code = error_code_from_group_error(&e);
-            // Even on error, kafka-python expects valid ConsumerProtocol format with version prefix
             let empty_assignment = {
                 let mut buf = BytesMut::new();
                 buf.extend_from_slice(&[0, 0]); // version 0
@@ -1123,7 +1107,6 @@ async fn handle_offset_fetch(
             (topic_name, partitions)
         }).collect()
     } else {
-        // If no topics specified, fetch all offsets for this group
         debug!("No topics specified in OffsetFetch, fetching all offsets for group {}", group_id);
         manager.get_all_offsets_for_group(&group_id)
     };
@@ -1174,7 +1157,6 @@ async fn handle_leave_group(
     let mut response = LeaveGroupResponse::default();
     response.throttle_time_ms = 0;
     
-    // Handle single member_id (older versions)
     if !request.member_id.is_empty() {
         let result = manager.leave_group(&group_id, &request.member_id.to_string());
         response.error_code = match result {
@@ -1182,7 +1164,6 @@ async fn handle_leave_group(
             Err(e) => error_code_from_group_error(&e),
         };
     } else if !request.members.is_empty() {
-        // Handle multiple members (newer versions)
         response.members = request.members.into_iter().map(|member| {
             let result = manager.leave_group(&group_id, &member.member_id.to_string());
             let mut member_response = MemberResponse::default();
@@ -1216,8 +1197,6 @@ async fn handle_list_offsets(
     let storage = storage.lock().await;
     
     if header.request_api_version == 0 {
-        // Manual parsing for v0 due to kafka-protocol-rs decode issues
-        // v0 format: replica_id(4) + topics array
         
         let _replica_id = buf.get_i32();
         let topics_len = buf.get_i32();
@@ -1278,7 +1257,6 @@ async fn handle_list_offsets(
         
         Ok(response_buf.to_vec())
     } else {
-        // For newer versions, use the standard decode
         let request = ListOffsetsRequest::decode(buf, header.request_api_version)?;
         
         let mut response = ListOffsetsResponse::default();
@@ -1363,8 +1341,6 @@ async fn handle_sasl_handshake(
     response_header.encode(&mut response_buf, 0)?;
     response.encode(&mut response_buf, header.request_api_version)?;
     
-    // For legacy clients (pre-0.10.2), expect raw SASL auth bytes instead of SaslAuthenticateRequest
-    // This is determined by the absence of SaslAuthenticate API in the version negotiation
     let expect_raw_auth = header.request_api_version == 0;
     
     Ok((response_buf.to_vec(), expect_raw_auth))
@@ -1379,19 +1355,16 @@ async fn handle_sasl_authenticate(
     
     let request = SaslAuthenticateRequest::decode(buf, header.request_api_version)?;
     
-    // For PLAIN mechanism, the auth bytes format is: \0username\0password
     let auth_bytes = &request.auth_bytes;
     let auth_str = String::from_utf8_lossy(auth_bytes);
     debug!("Auth bytes received (length: {})", auth_bytes.len());
     
-    // Simple parsing of PLAIN auth: \0username\0password
     let parts: Vec<&str> = auth_str.split('\0').collect();
     if parts.len() >= 3 {
         let username = parts[1];
         let _password = parts[2];
         debug!("Authentication attempt - username: {}", username);
         
-        // Always accept any username/password combination
         conn_state.authenticated = true;
         conn_state.username = Some(username.to_string());
         info!("Authentication successful for user: {}", username);

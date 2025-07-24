@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Compatibility test: verifies that Rustka behaves like Kafka
-"""
 from confluent_kafka import Producer, Consumer, KafkaError, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 import json
@@ -11,17 +8,12 @@ import threading
 import uuid
 
 class TestKafkaCompatibility(unittest.TestCase):
-    """Tests that should pass with both Kafka and Rustka"""
-    
     @classmethod
     def setUpClass(cls):
         cls.bootstrap_servers = '127.0.0.1:9092'
-        # Use unique topic for each test run to avoid conflicts
         cls.test_run_id = str(uuid.uuid4())[:8]
         cls.test_topic = f'test-compatibility-{cls.test_run_id}'
         print(f"Using topic: {cls.test_topic}")
-        
-        # Create topics
         admin = AdminClient({'bootstrap.servers': cls.bootstrap_servers})
         topics_to_create = [
             NewTopic(cls.test_topic, num_partitions=3, replication_factor=1),
@@ -34,11 +26,9 @@ class TestKafkaCompatibility(unittest.TestCase):
             try:
                 f.result()
             except Exception as e:
-                pass  # Topic might already exist
+                pass
     
     def test_01_produce_consume_basic(self):
-        """Basic test: produce and consume a message"""
-        # Use a unique group for this test
         group_id = f'test-basic-{self.test_run_id}'
         
         producer = Producer({
@@ -64,8 +54,6 @@ class TestKafkaCompatibility(unittest.TestCase):
         self.assertTrue(delivered)
         self.assertIsNotNone(partition)
         self.assertGreaterEqual(offset, 0)
-        
-        # Consume
         consumer = Consumer({
             'bootstrap.servers': self.bootstrap_servers,
             'group.id': group_id,
@@ -97,7 +85,6 @@ class TestKafkaCompatibility(unittest.TestCase):
         self.assertGreater(len(messages), 0)
     
     def test_02_consumer_group_rebalance(self):
-        """Test consumer group rebalancing"""
         topic = f'{self.test_topic}-rebalance'
         group_id = f'test-rebalance-{self.test_run_id}'
         consumed_by = {}

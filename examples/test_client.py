@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""
-Simple test client for Rustka using librdkafka
-"""
 from confluent_kafka import Producer, Consumer, KafkaError
 import json
 import time
 
 def test_rustka():
     print("Testing Rustka broker...")
-    
-    # Test 1: Metadata & Produce
     try:
         producer = Producer({
             'bootstrap.servers': '127.0.0.1:9092',
@@ -18,8 +13,6 @@ def test_rustka():
     except Exception as e:
         print(f"✗ Failed to connect: {e}")
         return
-    
-    # Test 2: Produce
     try:
         delivered = False
         partition = None
@@ -42,8 +35,6 @@ def test_rustka():
             print(f"✓ Produced message to partition {partition} at offset {offset}")
     except Exception as e:
         print(f"✗ Failed to produce: {e}")
-    
-    # Test 3: Consume
     try:
         consumer = Consumer({
             'bootstrap.servers': '127.0.0.1:9092',
@@ -53,8 +44,6 @@ def test_rustka():
         })
         
         consumer.subscribe(['test-topic'])
-        
-        # Poll for messages
         start_time = time.time()
         while time.time() - start_time < 2:
             msg = consumer.poll(0.1)

@@ -114,7 +114,6 @@ impl MetricsCollector {
             }
         });
         
-        // Update or add partition metrics
         if let Some(part) = topic_metrics.partitions.iter_mut().find(|p| p.id == partition) {
             part.high_watermark = high_watermark;
             part.message_count = high_watermark as u64;
@@ -126,7 +125,6 @@ impl MetricsCollector {
             });
         }
         
-        // Update total messages
         topic_metrics.total_messages = topic_metrics.partitions
             .iter()
             .map(|p| p.message_count)
@@ -163,7 +161,6 @@ impl MetricsCollector {
         metrics.topics_count = self.topic_metrics.read().await.len();
         metrics.consumer_groups_count = self.consumer_group_metrics.read().await.len();
         
-        // Update uptime
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -184,14 +181,12 @@ impl MetricsCollector {
     pub async fn cleanup_topic_metrics(&self, existing_topics: &[String]) {
         let mut topics = self.topic_metrics.write().await;
         
-        // Remove any topics that no longer exist in storage
         topics.retain(|topic_name, _| existing_topics.contains(topic_name));
     }
     
     pub async fn cleanup_consumer_group_metrics(&self, existing_groups: &[String]) {
         let mut groups = self.consumer_group_metrics.write().await;
         
-        // Remove any consumer groups that no longer exist
         groups.retain(|group_id, _| existing_groups.contains(group_id));
     }
 }

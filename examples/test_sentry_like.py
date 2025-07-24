@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
-"""
-Test that simulates Kafka usage by Sentry
-"""
 from confluent_kafka import Producer, Consumer, KafkaError
 import json
 import time
 import threading
 import random
-
-# Typical Sentry topics
 SENTRY_TOPICS = {
-    'events': 4,           # Error events
-    'transactions': 4,     # Performance monitoring
-    'attachments': 2,      # File attachments
-    'outcomes': 2,         # Event outcomes
-    'sessions': 2,         # Session tracking
+    'events': 4,
+    'transactions': 4,
+    'attachments': 2,
+    'outcomes': 2,
+    'sessions': 2,
 }
 
 def ensure_topics():
-    """Ensure all Sentry topics exist"""
-    # Skip topic creation - let Rustka auto-create them
-    # This avoids issues with AdminClient
     print("Skipping topic creation - Rustka will auto-create them")
 
 def produce_sentry_events():
-    """Simulates Sentry event production"""
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
     })
@@ -44,7 +35,6 @@ def produce_sentry_events():
         event_type = random.choice(event_types)
         project = random.choice(projects)
         
-        # Simulate different types of Sentry events
         if event_type == 'error':
             event = {
                 'type': 'error',
@@ -74,8 +64,6 @@ def produce_sentry_events():
                 'data': f'Test {event_type} {i}'
             }
             topic = event_type + 's'
-        
-        # Use project as key for partitioning
         producer.produce(topic, 
                         key=project.encode('utf-8'), 
                         value=json.dumps(event).encode('utf-8'),

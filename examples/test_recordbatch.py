@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""
-Test to debug RecordBatch format issues
-"""
 import sys
 from confluent_kafka import Producer, Consumer, KafkaError
 import json
 import time
 
 def test_single_fetch():
-    """Test fetching a single record"""
     print("1. Producing a single test record...")
     
     producer = Producer({
@@ -16,9 +12,6 @@ def test_single_fetch():
     })
     
     topic = f'test-{int(time.time())}'
-    
-    # Skip topic creation - let Rustka auto-create it
-    # This avoids potential issues with AdminClient
     
     test_value = json.dumps({'test': 'message', 'id': 1})
     
@@ -34,7 +27,7 @@ def test_single_fetch():
             offset = msg.offset()
     
     producer.produce(topic, value=test_value.encode('utf-8'), callback=delivery_report)
-    producer.flush(timeout=5)  # 5 second timeout
+    producer.flush(timeout=5)
     
     if delivered:
         print(f"✓ Produced to topic={topic}, partition={partition}, offset={offset}")
@@ -83,13 +76,9 @@ def test_single_fetch():
     return messages_found > 0
 
 def test_empty_topic():
-    """Test fetching from an empty topic"""
     print("\n3. Testing empty topic fetch...")
     
     topic = f'empty-test-{int(time.time())}'
-    
-    # Skip topic creation - let Rustka auto-create it
-    # This avoids potential issues with AdminClient
     
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
@@ -101,14 +90,12 @@ def test_empty_topic():
     consumer.subscribe([topic])
     
     try:
-        # Poll a few times
         for i in range(3):
             msg = consumer.poll(0.5)
             if msg is None:
                 continue
             if msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:
-                    # This is expected for empty topic
                     print("✓ Got expected PARTITION_EOF for empty topic")
                     return True
         print("✓ No messages in empty topic (as expected)")
@@ -122,7 +109,6 @@ def test_empty_topic():
         consumer.close()
 
 def test_batch_fetch():
-    """Test fetching multiple records"""
     print("\n4. Testing batch fetch...")
     
     producer = Producer({
@@ -130,9 +116,6 @@ def test_batch_fetch():
     })
     
     topic = f'batch-test-{int(time.time())}'
-    
-    # Skip topic creation - let Rustka auto-create it
-    # This avoids potential issues with AdminClient
     
     # Produce 5 records
     delivered = 0

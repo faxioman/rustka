@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Test Kafka message headers functionality"""
 
 import time
 import struct
@@ -7,28 +6,22 @@ from confluent_kafka import Producer, Consumer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 
 def ensure_topic(topic_name):
-    """Ensure topic exists"""
     admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     try:
-        # Try to create the topic
         topic = NewTopic(topic_name, num_partitions=1, replication_factor=1)
         fs = admin.create_topics([topic])
         for topic, f in fs.items():
             try:
-                f.result()  # The result itself is None
+                f.result()
                 print(f"Created topic {topic}")
             except Exception as e:
-                # Topic might already exist
                 pass
     except Exception as e:
         pass
 
 def test_headers():
-    """Test complete headers functionality"""
     print("\n=== Testing Kafka Headers Support ===")
-    
-    # Test 1: Basic headers with new API
     print("\n1. Testing basic headers...")
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
@@ -60,8 +53,6 @@ def test_headers():
     else:
         print(f"✗ Failed to send basic headers: {error_msg}")
         return False
-    
-    # Test 2: Sentry-style headers (version as 4-byte int)
     print("\n2. Testing Sentry-style headers...")
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
@@ -93,8 +84,6 @@ def test_headers():
     else:
         print(f"✗ Failed to send Sentry headers: {error_msg}")
         return False
-    
-    # Test 3: Headers with old fetch API (regression test for Sentry)
     print("\n3. Testing headers with old consumer API...")
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
@@ -121,12 +110,8 @@ def test_headers():
     else:
         print(f"✗ Failed to send for old API test: {error_msg}")
         return False
-    
-    # Verify all messages with headers
     print("\n4. Verifying headers...")
     all_passed = True
-    
-    # Check basic headers
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'test-headers-group-{int(time.time())}',
@@ -151,8 +136,6 @@ def test_headers():
     else:
         print("✗ Basic headers not found")
         all_passed = False
-    
-    # Check Sentry headers
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'test-headers-sentry-group-{int(time.time())}',
@@ -180,8 +163,6 @@ def test_headers():
     else:
         print("✗ Sentry headers not found")
         all_passed = False
-    
-    # Check old API compatibility
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': f'test-headers-old-api-group-{int(time.time())}',

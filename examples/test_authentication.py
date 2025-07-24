@@ -7,11 +7,9 @@ import time
 import sys
 
 def test_auth_producer():
-    """Test producer with SASL PLAIN authentication"""
     print("=== Testing Producer with SASL PLAIN Authentication ===")
     
     try:
-        # Create producer with SASL PLAIN authentication
         producer = Producer({
             'bootstrap.servers': '127.0.0.1:9092',
             'security.protocol': 'SASL_PLAINTEXT',
@@ -21,8 +19,6 @@ def test_auth_producer():
         })
         
         print("✅ Producer connected with authentication!")
-        
-        # Send a test message
         topic = 'auth-test-topic'
         message = b'Hello from authenticated producer!'
         
@@ -57,11 +53,9 @@ def test_auth_producer():
         return False
 
 def test_auth_consumer():
-    """Test consumer with SASL PLAIN authentication"""
     print("\n=== Testing Consumer with SASL PLAIN Authentication ===")
     
     try:
-        # Create consumer with SASL PLAIN authentication
         consumer = Consumer({
             'bootstrap.servers': '127.0.0.1:9092',
             'group.id': f'auth-test-group-{int(time.time())}',
@@ -74,8 +68,6 @@ def test_auth_consumer():
         
         consumer.subscribe(['auth-test-topic'])
         print("✅ Consumer connected with authentication!")
-        
-        # Try to consume messages
         print("   Waiting for messages...")
         
         start_time = time.time()
@@ -115,11 +107,9 @@ def test_auth_consumer():
         return False
 
 def test_wrong_credentials():
-    """Test connection with different credentials"""
     print("\n=== Testing Connection with Different Credentials ===")
     
     try:
-        # Rustka accepts any credentials, so this should also work
         producer = Producer({
             'bootstrap.servers': '127.0.0.1:9092',
             'security.protocol': 'SASL_PLAINTEXT',
@@ -127,8 +117,6 @@ def test_wrong_credentials():
             'sasl.username': 'anyuser',
             'sasl.password': 'anypass',
         })
-        
-        # Try to send a message
         delivered = False
         error_msg = None
         
@@ -154,31 +142,22 @@ def test_wrong_credentials():
         return False
 
 def main():
-    """Run all authentication tests"""
     print("Running SASL PLAIN authentication tests...\n")
     
     tests_passed = 0
     tests_failed = 0
-    
-    # Test 1: Producer with correct credentials
     if test_auth_producer():
         tests_passed += 1
     else:
         tests_failed += 1
-    
-    # Test 2: Consumer with correct credentials
     if test_auth_consumer():
         tests_passed += 1
     else:
         tests_failed += 1
-    
-    # Test 3: Different credentials (should also work)
     if test_wrong_credentials():
         tests_passed += 1
     else:
         tests_failed += 1
-    
-    # Summary
     print("\n" + "="*50)
     print(f"Tests passed: {tests_passed}")
     print(f"Tests failed: {tests_failed}")

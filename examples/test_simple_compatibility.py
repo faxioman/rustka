@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Simple Kafka compatibility test
-"""
 import sys
 
 try:
@@ -16,7 +13,6 @@ import json
 import time
 
 def ensure_topic(topic_name):
-    """Ensure topic exists"""
     admin = AdminClient({'bootstrap.servers': '127.0.0.1:9092'})
     
     try:
@@ -26,15 +22,12 @@ def ensure_topic(topic_name):
             try:
                 f.result()
             except Exception as e:
-                pass  # Topic might already exist
+                pass
     except Exception as e:
         pass
 
 def test_basic_produce_consume():
-    """Basic produce/consume test"""
     print("\n1. Testing basic produce...")
-    
-    # Ensure topic exists
     ensure_topic('test-topic')
     
     try:
@@ -104,18 +97,12 @@ def test_basic_produce_consume():
     return True
 
 def test_consumer_group():
-    """Test consumer group base"""
     print("\n3. Testing consumer groups...")
     
     try:
-        # Use unique topic for this test
         topic_name = f'test-cg-topic-{int(time.time())}'
         group_id = f'test-group-{int(time.time())}'
-        
-        # Ensure topic exists
         ensure_topic(topic_name)
-        
-        # Produce a message first
         producer = Producer({
             'bootstrap.servers': '127.0.0.1:9092',
         })
@@ -123,8 +110,6 @@ def test_consumer_group():
         test_msg = f'Group test at {time.time()}'
         producer.produce(topic_name, test_msg.encode())
         producer.flush()
-        
-        # Consumer with group
         consumer = Consumer({
             'bootstrap.servers': '127.0.0.1:9092',
             'group.id': group_id,
@@ -134,8 +119,6 @@ def test_consumer_group():
         
         consumer.subscribe([topic_name])
         print(f"✓ Joined consumer group '{group_id}'")
-        
-        # Try to consume
         messages_consumed = 0
         start_time = time.time()
         while time.time() - start_time < 5:
@@ -163,13 +146,10 @@ def test_consumer_group():
         return False
 
 def test_offset_management():
-    """Test offset commit/fetch"""
     print("\n4. Testing offset management...")
     
     try:
         group_id = f'test-offset-group-{int(time.time())}'
-        
-        # First consumer: read and commit
         consumer1 = Consumer({
             'bootstrap.servers': '127.0.0.1:9092',
             'group.id': group_id,
@@ -178,8 +158,6 @@ def test_offset_management():
         })
         
         consumer1.subscribe(['test-topic'])
-        
-        # Read one message and commit
         committed_offset = None
         partition_used = None
         start_time = time.time()
@@ -202,8 +180,6 @@ def test_offset_management():
         if committed_offset is None:
             print("✗ No message to commit")
             return False
-        
-        # Second consumer: should start after committed offset
         consumer2 = Consumer({
             'bootstrap.servers': '127.0.0.1:9092',
             'group.id': group_id,
@@ -211,11 +187,7 @@ def test_offset_management():
         })
         
         consumer2.subscribe(['test-topic'])
-        
-        # Poll to trigger assignment
         consumer2.poll(timeout=1.0)
-        
-        # Check committed offset
         assignment = consumer2.assignment()
         if assignment:
             for partition in assignment:

@@ -15,7 +15,7 @@ print("Creating producer with debug logging...")
 try:
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
-        'debug': 'broker,topic,msg',  # Enable debug logging
+        'debug': 'broker,topic,msg',
     })
     
     print("\nProducer created! Sending message...")
@@ -27,8 +27,6 @@ try:
             print(f"\nSuccess! Message sent to partition {msg.partition()} offset {msg.offset()}")
     
     producer.produce('test', b'hello', callback=delivery_report)
-    
-    # Wait for delivery
     producer.flush(timeout=5)
     
 except Exception as e:

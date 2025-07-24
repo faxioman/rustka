@@ -8,7 +8,6 @@ import time
 import threading
 
 def producer_thread(topic_name):
-    """Produce messages continuously"""
     producer = Producer({
         'bootstrap.servers': '127.0.0.1:9092',
     })
@@ -22,13 +21,12 @@ def producer_thread(topic_name):
         value = json.dumps(msg).encode('utf-8')
         producer.produce(topic_name, value, partition=i % 3, callback=delivery_report)
         print(f"Produced: {msg}")
-        producer.poll(0)  # Trigger delivery reports
+        producer.poll(0)
         time.sleep(0.5)
     
     producer.flush()
 
 def consumer_in_group(consumer_id, topic_name, group_id='test-group'):
-    """Consumer that is part of a consumer group"""
     consumer = Consumer({
         'bootstrap.servers': '127.0.0.1:9092',
         'group.id': group_id,
@@ -69,22 +67,15 @@ def consumer_in_group(consumer_id, topic_name, group_id='test-group'):
         consumer.close()
 
 def test_consumer_group():
-    """Test multiple consumers in a group"""
     topic = f'test-group-{int(time.time())}'
-    
-    # Pre-create topic by producing one message
     producer = Producer({'bootstrap.servers': '127.0.0.1:9092'})
     producer.produce(topic, b'init', partition=0)
     producer.flush()
     
     print(f"Testing consumer group with topic: {topic}")
-    
-    # Start producer in background
     producer_t = threading.Thread(target=producer_thread, args=(topic,))
     producer_t.daemon = True
     producer_t.start()
-    
-    # Start consumers
     consumers = []
     for i in range(3):
         t = threading.Thread(
@@ -94,7 +85,7 @@ def test_consumer_group():
         t.daemon = True
         t.start()
         consumers.append(t)
-        time.sleep(1)  # Stagger consumer starts
+        time.sleep(1)
     
     print("\nRunning for 20 seconds...")
     print("You should see partitions distributed among consumers")
