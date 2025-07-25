@@ -106,6 +106,7 @@ impl KafkaBroker {
             loop {
                 interval.tick().await;
                 let mut manager = group_manager_clone.lock().await;
+                manager.complete_timed_out_rebalances();
                 manager.check_expired_members();
                 manager.cleanup_orphaned_offsets();
             }
@@ -896,7 +897,8 @@ async fn handle_join_group(
         .map(|p| (p.name.to_string(), p.metadata.clone()))
         .collect();
     
-    let result = manager.join_group(
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    manager.join_group(
         group_id,
         member_id,
         client_id,
@@ -905,29 +907,25 @@ async fn handle_join_group(
         rebalance_timeout_ms,
         request.protocol_type.to_string(),
         protocols,
+        tx,
     );
     
-    let mut response = JoinGroupResponse::default();
+    drop(manager);
+    let join_result = rx.await.map_err(|_| "Failed to receive join group response")?;
     
-    match result {
-        Ok(join_result) => {
-            response.error_code = join_result.error_code;
-            response.generation_id = join_result.generation_id;
-            response.protocol_type = Some(request.protocol_type.clone());
-            response.protocol_name = Some(join_result.protocol_name.into());
-            response.leader = join_result.leader_id.clone().into();
-            response.member_id = join_result.member_id.into();
-            response.members = join_result.members.into_iter().map(|(id, metadata)| {
-                let mut member = JoinGroupResponseMember::default();
-                member.member_id = id.into();
-                member.metadata = metadata;
-                member
-            }).collect();
-        }
-        Err(e) => {
-            response.error_code = error_code_from_group_error(&e);
-        }
-    }
+    let mut response = JoinGroupResponse::default();
+    response.error_code = join_result.error_code;
+    response.generation_id = join_result.generation_id;
+    response.protocol_type = Some(request.protocol_type.clone());
+    response.protocol_name = Some(join_result.protocol_name.into());
+    response.leader = join_result.leader_id.clone().into();
+    response.member_id = join_result.member_id.into();
+    response.members = join_result.members.into_iter().map(|(id, metadata)| {
+        let mut member = JoinGroupResponseMember::default();
+        member.member_id = id.into();
+        member.metadata = metadata;
+        member
+    }).collect();
     
     response.throttle_time_ms = 0;
 

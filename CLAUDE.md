@@ -137,6 +137,15 @@ The current implementation works well for testing and development but would need
 - No transactions
 - No ACLs beyond basic SASL
 - Consumer group rebalancing is simplified (immediate completion)
+- **Consumer group partition assignment bug with 2 consumers**:
+  - When C2 joins while C1 has all partitions, C2 may not receive partition assignments
+  - Root cause: Our broker architecture responds to each request immediately
+  - The Kafka protocol requires blocking JoinGroup requests during rebalancing
+  - Specifically: When members join during PreparingRebalance, the broker should hold their requests until all members join or timeout expires, then respond to all simultaneously
+  - Our current implementation cannot hold requests - it must respond immediately
+  - This causes C2 to proceed with sync_group before the leader has calculated assignments for all members
+  - The fix requires significant architectural changes to support request queueing and delayed responses
+  - Workaround: Use 3+ consumers where timing is less critical
 
 ## Debugging
 ```bash
@@ -170,6 +179,10 @@ RUST_LOG=debug ./target/release/rustka
 ## Important Rules
 - **NEVER make git commits** - The user will ALWAYS make commits themselves when they decide
 - **NEVER hide test failures** - If something is wrong, tests must fail visibly
+- **NEVER hide test errors** - If you see errors in test output (like "❌ Rebalancing broken"), you MUST report them honestly. NEVER hide test errors
+- **NEVER blame timing issues** - Timing is NEVER the real problem, the protocol implementation is wrong
+- **NEVER implement workarounds** - Fix the actual problem, don't patch around it
+- **IMPLEMENT THE PROTOCOL CORRECTLY** - Follow the Kafka protocol specification exactly
 - **NEVER assume client libraries (librdkafka, kafka-python, confluent-kafka, etc.) are doing something wrong** - These are mature, battle-tested implementations. If there's a compatibility issue, the error is CERTAINLY in Rustka's implementation
 - **NO "phantom connections" exist** - If multiple members are being created, it's because Rustka is not correctly implementing the consumer group protocol
 - **IF SOMETHING WORKS ON REDPANDA BUT NOT ON RUSTKA, IT'S ALWAYS A BUG IN RUSTKA** - NEVER blame the client, NEVER make excuses. If Redpanda handles it correctly, Rustka MUST handle it correctly too. THE BUG IS ALWAYS IN RUSTKA.
