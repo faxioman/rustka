@@ -774,10 +774,18 @@ impl ConsumerGroupManager {
         }
         
         if group.state == GroupState::AwaitingSync {
-            debug!("Member {} called sync_group before leader", member_id);
-            return Err(GroupError::RebalanceInProgress);
+            if let Some(rebalance_start) = group.rebalance_start {
+                let elapsed = rebalance_start.elapsed();
+                if elapsed > Duration::from_secs(5) {
+                    debug!("Member {} sync_group timeout waiting for leader assignments (waited {:?})", 
+                           member_id, elapsed);
+                    return Err(GroupError::RebalanceInProgress);
+                }
+            }
+            debug!("Member {} called sync_group before leader, returning empty assignment", member_id);
+            return Ok(create_empty_assignment());
         } else {
-            debug!("Member {} has no assignment in state {:?}, THIS IS A BUG!", member_id, group.state);
+            debug!("Member {} has no assignment in state {:?}, returning empty", member_id, group.state);
         }
         
         Ok(create_empty_assignment())

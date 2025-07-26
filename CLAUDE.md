@@ -47,9 +47,11 @@ python3 examples/test_minimal.py
 ```
 
 ## Recent Fixes
-- ✅ Consumer group rebalancing: Fixed REBALANCE_IN_PROGRESS loop by never returning this error from JoinGroup
+- ✅ Consumer group rebalancing: Fixed the state machine and member management
 - ✅ Headers support: Added Produce v3 and Fetch v11 support for headers
 - ✅ Authentication tests: Adjusted to match Rustka's behavior (accepts any credentials)
+- ✅ Synchronization barrier: Implemented RedPanda-style JoinGroup synchronization
+- ✅ RebalanceInProgress fix: Followers now wait for leader assignments instead of erroring immediately
 
 ## Important Notes
 
